@@ -1,0 +1,31 @@
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+
+# Databases and Citizen Personal Data (PII)
+*.db
+*.sqlite
+*.sqlite3
+ihma_database.db
+fuqarolar.xlsx
+murojaatlar.xlsx
+navbatlar.xlsx
+backups/
+dalolatnomalar/
+
+# Logs and runtime artifacts
+*.log
+bot.log
+
+# Binaries and caches
+bin/
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+admin_social_kb/
