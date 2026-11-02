@@ -63,6 +63,17 @@ def text_matches(query: str, target: str) -> bool:
     return norm_query in norm_target
 
 
+# Кириллга ўгирилмайдиган қисмлар: <code>/<pre> блоклари, HTML теглар ва entity лар,
+# URL ва домен номлари, ҳамда M-1001 / Q-0001 / N-101 кўринишидаги рақамлар.
+_CONVERSION_PROTECTED_RE = re.compile(
+    r"(<code>.*?</code>|<pre>.*?</pre>|<[^>]+>"
+    r"|&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);"
+    r"|https?://[^\s<>\"]+|\b(?:my\.gov\.uz|ihma\.uz)\b"
+    r"|\b[MQN]-\d+\b)",
+    re.DOTALL,
+)
+
+
 def latin_to_cyrillic_uz(text: str) -> str:
     """
     Ўзбек лотин ёзувидаги матнни (HTML теглари ва URL манзилларни бузмасдан)
@@ -71,17 +82,16 @@ def latin_to_cyrillic_uz(text: str) -> str:
     """
     if not text:
         return ""
-    parts = re.split(r"(<[^>]+>|https?://[^\s<>\"]+)", str(text))
-    vowels = set("aeiouAEIOUаеёиоуэюяАЕЁИОУЭЮЯ")
+    # HTML entity va apostroflarni tozalash
+    source = str(text).replace("&#x27;", "'").replace("&#39;", "'").replace("&apos;", "'").replace("&quot;", '"')
+    parts = _CONVERSION_PROTECTED_RE.split(source)
     out = []
     for p in parts:
-        if (p.startswith("<") and p.endswith(">")) or p.startswith("http://") or p.startswith("https://") or "my.gov.uz" in p:
+        if _CONVERSION_PROTECTED_RE.fullmatch(p):
             out.append(p)
             continue
 
         s = p
-        # HTML entity va apostroflarni tozalash
-        s = s.replace("&#x27;", "'").replace("&#39;", "'").replace("&apos;", "'").replace("&quot;", '"')
         # 1. Янги лотин ҳарфлари
         s = s.replace("Ó", "Ў").replace("ó", "ў")
         s = s.replace("Ǵ", "Ғ").replace("ǵ", "ғ")

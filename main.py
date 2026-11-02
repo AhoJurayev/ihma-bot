@@ -23,8 +23,11 @@ import json
 import time
 import urllib.request
 import threading
+import logging
+import builtins
+from collections import Counter
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
-import pandas as pd
 import telebot
 from telebot import types
 import google.generativeai as genai
@@ -37,9 +40,6 @@ from knowledge_base import (
     get_knowledge_base_stats,
 )
 from local_legal_advisor import try_local_answer
-import database
-database.init_database()
-import admin_ai_assistant
 
 # ==============================================================================
 # 1. SOZLAMALAR (CONFIG) VA XAVFSIZLIK (ENVIRONMENT VARIABLES)
@@ -71,6 +71,11 @@ def load_env_file(filepath=None):
 
 load_env_file()
 
+# .env o'qilgandan keyin yuklanadi: baza yo'li IHMA_DATA_DIR ga bog'liq
+import database
+database.init_database()
+import admin_ai_assistant
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -96,23 +101,52 @@ for i in range(2, 6):
     if extra_k and extra_k not in GEMINI_API_KEYS:
         GEMINI_API_KEYS.append(extra_k)
 
-bot = telebot.TeleBot(TOKEN)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+logger = logging.getLogger("ihma.bot")
+
+
+def _setup_file_logging():
+    """Barcha xabarlarni admin paneli o'qiydigan bot.log ga yozadi (5 MB dan 3 ta fayl)."""
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        return
+    file_handler = RotatingFileHandler(
+        os.path.join(BASE_DIR, "bot.log"), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(file_handler)
+
+
+def print(*args, **kwargs):
+    """Konsolga chiqarish bilan birga loglash: kod bo'ylab print ishlatilgan."""
+    builtins.print(*args, **kwargs)
+    logger.info(" ".join(str(a) for a in args))
+
+
+class BotExceptionHandler(telebot.ExceptionHandler):
+    """Handler xatosi polling ni to'xtatmasligi va logda qolishi uchun."""
+
+    def handle(self, exception):
+        logger.error("Handler xatosi: %s", exception, exc_info=exception)
+        return True
+
+
+# Bloklovchi AI so'rovlari boshqa fuqarolarni kuttirib qo'ymasligi uchun ishchi oqimlar soni oshirilgan
+bot = telebot.TeleBot(TOKEN, num_threads=8, exception_handler=BotExceptionHandler())
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
 
 if GEMINI_API_KEYS:
     genai.configure(api_key=GEMINI_API_KEYS[0])
 
-# Excel fayllar bilan ishlashda oqim xavfsizligi (Thread Lock)
-excel_lock = threading.Lock()
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-EXCEL_FILE = os.path.join(BASE_DIR, "fuqarolar.xlsx")
-MUROJAAT_FILE = os.path.join(BASE_DIR, "murojaatlar.xlsx")
 OFERTA_FILE = os.path.join(BASE_DIR, "Shayxali_MFY_bot_oferta.pdf")
-NAVBAT_FILE = os.path.join(BASE_DIR, "navbatlar.xlsx")
+
+# AI so'rovlari uchun vaqt chegaralari (soniya)
+AI_REQUEST_TIMEOUT = 45
+AI_TOTAL_TIMEOUT = 120
 
 # Minimal iste'mol xarajatlari (so'mda)
-MINIMAL_ISTEMOL_XARAJATI = 648000
+MINIMAL_ISTEMOL_XARAJATI = 669000
 
 # Majburiy yakuniy AI ogohlantirish matni (Foydalanuvchi talabiga asosan butunlay tozalandi)
 AI_DISCLAIMER = ""
@@ -235,14 +269,15 @@ def call_groq_api(prompt: str, system_prompt: str = "") -> SafeAIResponse:
     raise RuntimeError("Barcha Groq modellari xatolik berdi yoki ulanishda muammo.")
 
 
-def call_gemini_safe(contents):
+def call_ai_strict(contents):
     """
-    1-bosqich: Google Gemini (gemini-2.5-flash va boshqa modellar) orqali so'rov yuborish.
+    1-bosqich: Google Gemini (GEMINI_MODEL_NAME va zaxira modellar) orqali so'rov yuborish.
     PII Masking (O'RQ-547) avtomatik qo'llaniladi.
     2-bosqich: Gemini tokeni/kvotasi tugasa avtomatik Groq zaxira kalitiga o'tadi.
-    3-bosqich: Barcha provayderlar ishlamasa, xavfsiz huquqiy tushuntirish qaytaradi.
+    Barcha provayderlar ishlamasa RuntimeError ko'taradi.
     """
     last_gemini_err = None
+    deadline = time.monotonic() + AI_TOTAL_TIMEOUT
 
     # Shaxsiy ma'lumotlarni niqoblash
     if isinstance(contents, str):
@@ -253,8 +288,8 @@ def call_gemini_safe(contents):
         safe_contents = contents
 
     gemini_models = [
-        "gemini-2.5-flash",
         GEMINI_MODEL_NAME,
+        "gemini-2.5-flash",
         "gemini-flash-lite-latest",
         "gemini-3.5-flash",
         "gemini-3.6-flash",
@@ -271,13 +306,15 @@ def call_gemini_safe(contents):
 
         for m_name in uniq_models:
             for retry in range(2):
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     model_inst = genai.GenerativeModel(
                         model_name=m_name,
                         generation_config=generation_config,
                         system_instruction=SYSTEM_PROMPT,
                     )
-                    resp = model_inst.generate_content(safe_contents)
+                    resp = model_inst.generate_content(safe_contents, request_options={"timeout": AI_REQUEST_TIMEOUT})
                     if hasattr(resp, "text") and resp.text:
                         resp = SafeAIResponse(latin_to_cyrillic_uz(resp.text))
                     return resp
@@ -290,13 +327,23 @@ def call_gemini_safe(contents):
                     continue
 
     # Zaxira Groq API ga o'tish
+    groq_err = None
     if isinstance(contents, str):
         try:
             return call_groq_api(contents, system_prompt=SYSTEM_PROMPT)
-        except Exception as groq_err:
-            pass
+        except Exception as e:
+            groq_err = e
 
-    # Xavfsiz qonuniy fallback javobi
+    raise RuntimeError(f"AI provayderlari javob bermadi (Gemini: {last_gemini_err}; Groq: {groq_err})")
+
+
+def call_gemini_safe(contents):
+    """call_ai_strict bilan bir xil, lekin barcha provayderlar ishlamasa xavfsiz huquqiy tushuntirish qaytaradi."""
+    try:
+        return call_ai_strict(contents)
+    except Exception as e:
+        print("AI so'rovi bajarilmadi:", e)
+
     fallback_text = (
         "Ҳурматли фуқаро! Сиз сўраган масала бўйича қонуний асослар ва меъёрий ҳужжатларни аниқлаштириш талаб этилади. "
         "Сунъий интеллект тизимида расмий қарор қабул қилиш ваколати мавжуд эмас. "
@@ -426,50 +473,6 @@ NAVBAT_COLUMNS = [
 ]
 
 
-def init_excel_files():
-    with excel_lock:
-        if not os.path.exists(EXCEL_FILE):
-            df = pd.DataFrame(columns=FUQAROLAR_COLUMNS)
-            df.to_excel(EXCEL_FILE, index=False)
-        else:
-            df = pd.read_excel(EXCEL_FILE, dtype=str)
-            changed = False
-            for col in FUQAROLAR_COLUMNS:
-                if col not in df.columns:
-                    df[col] = "uz_lat" if col == "Til" else ""
-                    changed = True
-            if changed:
-                df.to_excel(EXCEL_FILE, index=False)
-
-        if not os.path.exists(MUROJAAT_FILE):
-            df_m = pd.DataFrame(columns=MUROJAAT_COLUMNS)
-            df_m.to_excel(MUROJAAT_FILE, index=False)
-        else:
-            df_m = pd.read_excel(MUROJAAT_FILE, dtype=str)
-            changed = False
-            for col in MUROJAAT_COLUMNS:
-                if col not in df_m.columns:
-                    df_m[col] = ""
-                    changed = True
-            if changed:
-                df_m.to_excel(MUROJAAT_FILE, index=False)
-
-        if not os.path.exists(NAVBAT_FILE):
-            df_n = pd.DataFrame(columns=NAVBAT_COLUMNS)
-            df_n.to_excel(NAVBAT_FILE, index=False)
-        else:
-            df_n = pd.read_excel(NAVBAT_FILE, dtype=str)
-            changed = False
-            for col in NAVBAT_COLUMNS:
-                if col not in df_n.columns:
-                    df_n[col] = ""
-                    changed = True
-            if changed:
-                df_n.to_excel(NAVBAT_FILE, index=False)
-
-
-init_excel_files()
-
 # Vaqtinchalik xotira (sessiya holatlari)
 user_data = {}
 admin_state = {}
@@ -480,7 +483,7 @@ CYR_TO_LAT_PASSPORT = str.maketrans({
     "А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E", "Ф": "F",
     "Г": "G", "Ҳ": "H", "И": "I", "Ж": "J", "К": "K", "Л": "L",
     "М": "M", "Н": "N", "О": "O", "П": "P", "Қ": "Q", "Р": "R",
-    "С": "S", "Т": "T", "У": "U", "В": "V", "Х": "X", "Й": "Y", "З": "Z",
+    "Т": "T", "У": "U", "Х": "X", "Й": "Y", "З": "Z",
 })
 
 
@@ -557,74 +560,6 @@ def cyrillic_to_latin_uz(text: str) -> str:
     return "".join(out)
 
 
-def latin_to_cyrillic_uz(text: str) -> str:
-    """
-    O'zbek lotin matnini (HTML teglarni va URL larni buzmasdan)
-    standart kirill yozuviga xatosiz o'giradi.
-    """
-    if not text:
-        return ""
-    parts = re.split(r"(<[^>]+>)", text)
-    vowels = set("aeiouAEIOU")
-    out = []
-    for p in parts:
-        if (p.startswith("<") and p.endswith(">")) or any(u in p for u in ["http://", "https://", "my.gov.uz"]):
-            out.append(p)
-            continue
-
-        s = p
-        s = s.replace("Ó", "Ў").replace("ó", "ў")
-        s = s.replace("Ǵ", "Ғ").replace("ǵ", "ғ")
-        s = s.replace("Ş", "Ш").replace("ş", "ш")
-        s = s.replace("Ç", "Ч").replace("ç", "ч")
-        s = re.sub(r"[O0][\‘\’\`\´\ʼ\']", "Ў", s)
-        s = re.sub(r"o[\‘\’\`\´\ʼ\']", "ў", s)
-        s = re.sub(r"G[\‘\’\`\´\ʼ\']", "Ғ", s)
-        s = re.sub(r"g[\‘\’\`\´\ʼ\']", "ғ", s)
-        s = s.replace("Sh", "Ш").replace("SH", "Ш").replace("sh", "ш")
-        s = s.replace("Ch", "Ч").replace("CH", "Ч").replace("ch", "ч")
-        s = s.replace("Yo", "Ё").replace("YO", "Ё").replace("yo", "ё")
-        s = s.replace("Yu", "Ю").replace("YU", "Ю").replace("yu", "ю")
-        s = s.replace("Ya", "Я").replace("YA", "Я").replace("ya", "я")
-        s = s.replace("Ye", "Е").replace("YE", "Е").replace("ye", "е")
-        s = s.replace("Ts", "Ц").replace("TS", "Ц").replace("ts", "ц")
-
-        res = []
-        for i, c in enumerate(s):
-            prev_c = s[i - 1] if i > 0 else " "
-            if c == "E":
-                if i == 0 or not prev_c.isalpha():
-                    res.append("Э")
-                elif prev_c in vowels:
-                    res.append("Е")
-                else:
-                    res.append("Э")
-                continue
-            elif c == "e":
-                if i == 0 or not prev_c.isalpha():
-                    res.append("э")
-                elif prev_c in vowels:
-                    res.append("е")
-                else:
-                    res.append("е")
-                continue
-
-            mp = {
-                "A": "А", "a": "а", "B": "Б", "b": "б", "D": "Д", "d": "д",
-                "F": "Ф", "f": "ф", "G": "Г", "g": "г", "H": "Ҳ", "h": "ҳ",
-                "I": "И", "i": "и", "J": "Ж", "j": "ж", "K": "К", "k": "к",
-                "L": "Л", "l": "л", "M": "М", "m": "м", "N": "Н", "n": "н",
-                "O": "О", "o": "о", "P": "П", "p": "п", "Q": "Қ", "q": "қ",
-                "R": "Р", "r": "р", "S": "С", "s": "с", "T": "Т", "t": "т",
-                "U": "У", "u": "у", "V": "В", "v": "в", "X": "Х", "x": "х",
-                "Y": "Й", "y": "й", "Z": "З", "z": "з",
-                "'": "ъ", "‘": "ъ", "’": "ъ", "ʼ": "ъ", "`": "ъ",
-            }
-            res.append(mp.get(c, c))
-        out.append("".join(res))
-    return "".join(out)
-
-
 def get_user_lang(user_id) -> str:
     if user_id in user_lang_cache:
         lang = user_lang_cache[user_id]
@@ -639,15 +574,6 @@ def get_user_lang(user_id) -> str:
 def set_user_lang(user_id, lang_code: str):
     user_lang_cache[user_id] = lang_code
     database.set_user_lang(user_id, lang_code)
-    with excel_lock:
-        try:
-            df = pd.read_excel(EXCEL_FILE, dtype=str).fillna("")
-            uid_str = str(user_id)
-            if uid_str in df["Telegram_ID"].astype(str).values:
-                df.loc[df["Telegram_ID"].astype(str) == uid_str, "Til"] = lang_code
-                df.to_excel(EXCEL_FILE, index=False)
-        except Exception as e:
-            print("Tilni saqlashda xatolik:", e)
 
 
 def localize_text(user_id, text_uz: str, text_ru: str = None) -> str:
@@ -1843,6 +1769,8 @@ def handle_admin_document_upload(message):
     try:
         file_info = bot.get_file(doc.file_id)
         downloaded = bot.download_file(file_info.file_path)
+        # Fayl nomi foydalanuvchidan keladi: papkadan tashqariga yozilmasligi uchun faqat oxirgi qismi olinadi
+        fname = os.path.basename(fname.replace("\\", "/")) or "hujjat.pdf"
         dest_path = os.path.join(HUJJATLAR_DIR, fname)
         with open(dest_path, "wb") as f_out:
             f_out.write(downloaded)
@@ -2025,8 +1953,7 @@ def handle_voice_message(message):
         file_info = bot.get_file(file_id)
         audio_bytes = bot.download_file(file_info.file_path)
 
-        gemini_key = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else None
-        transkripsiya = transcribe_audio_bytes(audio_bytes, filename="voice.ogg", gemini_api_key=gemini_key)
+        transkripsiya = transcribe_audio_bytes(audio_bytes, filename="voice.ogg")
         transkripsiya_cyr = latin_to_cyrillic_uz(transkripsiya)
 
         process_and_dispatch_question(
@@ -2036,15 +1963,15 @@ def handle_voice_message(message):
             progress_msg_id=wait_msg.message_id,
         )
     except Exception as e:
-        safe_delete_message(message.chat.id, wait_msg.message_id)
-        bot.reply_to(message, f"⚠️ Овозли хабарни таҳлил қилишда хатолик: {e}")
-
-    except Exception as e:
         print("Ovozli xabarni tahlil qilishda xatolik:", e)
-        bot.edit_message_text(
-            "⚠️ Ovozli xabarni qayta ishlashda texnik uzilish yuz berdi. Iltimos, savolingizni matn shaklida yozib yuboring.",
-            message.chat.id,
-            wait_msg.message_id,
+        safe_delete_message(message.chat.id, wait_msg.message_id)
+        bot.reply_to(
+            message,
+            localize_text(
+                message.from_user.id,
+                "⚠️ Овозли хабарни қайта ишлашда техник узилиш юз берди. Илтимос, саволингизни матн шаклида ёзиб юборинг.",
+                "⚠️ Не удалось обработать голосовое сообщение. Пожалуйста, напишите вопрос текстом.",
+            ),
         )
 
 
@@ -2111,7 +2038,7 @@ def execute_citizen_search(chat_id, query: str):
         u_appeals = database.get_citizen_appeals(tg_id) if tg_id else []
         appeals_info = f"{len(u_appeals)} та мурожаат"
         if u_appeals:
-            last_a = u_appeals[-1]
+            last_a = u_appeals[0]  # ro'yxat eng yangisidan boshlanadi
             appeals_info += f" (Охиргиси: {esc(last_a.get('Murojaat_ID'))} — {esc(last_a.get('Status'))})"
 
         fio_c = latin_to_cyrillic_uz(row.get('FIO', ''))
@@ -2143,14 +2070,11 @@ def handle_xisobot_command(message):
 
 def generate_monthly_ai_report(chat_id, oy_yil: str):
     """
-    Belgilangan oy (masalan: 10-2026) uchun murojaatlar.xlsx ni o'qiydi.
+    Belgilangan oy (masalan: 10-2026) uchun murojaatlarni bazadan o'qiydi.
     XAVFSIZLIK: Fuqarolarning F.I.Sh. va shaxsiy ma'lumotlari Gemini AI ga YUBORILMAYDI!
     """
-    with excel_lock:
-        df_m = pd.read_excel(MUROJAAT_FILE, dtype=str).fillna("")
-
-    df_month = df_m[df_m["Oy_Yil"].astype(str) == oy_yil]
-    if df_month.empty:
+    month_appeals = database.get_month_appeals(oy_yil)
+    if not month_appeals:
         bot.send_message(
             chat_id,
             f"📂 <b>{esc(oy_yil)}</b> davri uchun bazada hali murojaatlar mavjud emas.",
@@ -2159,7 +2083,7 @@ def generate_monthly_ai_report(chat_id, oy_yil: str):
         return
 
     db_stats = database.get_monthly_appeal_stats(oy_yil)
-    total = db_stats.get("total", len(df_month))
+    total = db_stats.get("total", len(month_appeals))
     ijobiy = db_stats.get("ijobiy", 0)
     rad = db_stats.get("rad", 0)
     kutmoqda = db_stats.get("kutmoqda", 0)
@@ -2169,12 +2093,12 @@ def generate_monthly_ai_report(chat_id, oy_yil: str):
     csat_display = f"{csat_avg} / 5.0 ({csat_count} ta baho)" if csat_count > 0 else "Hali baholar mavjud emas"
 
     # Eng ko'p murojaat qilgan fuqarolarni lokal Python hisoblaydi (AI ga yuborilmaydi)
-    top_citizens = df_month["FIO"].value_counts().head(3).to_dict()
-    top_citizens_str = ", ".join([f"{k} ({v} marta)" for k, v in top_citizens.items()])
+    top_citizens = Counter(a.get("FIO") for a in month_appeals if a.get("FIO")).most_common(3)
+    top_citizens_str = ", ".join([f"{k} ({v} marta)" for k, v in top_citizens])
 
     # Savollar ro'yxati (shaxsiy raqamlarsiz)
     savollar_namunasi = "\n".join(
-        [f"- {tozalash_regex(str(s))[:120]}" for s in df_month["Savol"].tail(40).tolist()]
+        [f"- {tozalash_regex(str(a.get('Savol') or ''))[:120]}" for a in month_appeals[-40:]]
     )
 
     report_prompt = (
@@ -2387,6 +2311,10 @@ def show_admin_settings_panel(chat_id, message_id=None):
         types.InlineKeyboardButton("📜 Тизим логлари (Logs)", callback_data="adm_system_logs"),
     )
     markup.add(
+        types.InlineKeyboardButton("📅 Қабулни очиш / ёпиш", callback_data="adm_toggle_queue"),
+        types.InlineKeyboardButton("🕒 Қабул соатлари", callback_data="adm_set_queue_hours"),
+    )
+    markup.add(
         types.InlineKeyboardButton("🤖 AI Диагностика", callback_data="adm_ai_diagnostics"),
         types.InlineKeyboardButton("🗄️ База заҳираси (.db)", callback_data="adm_db_backup"),
     )
@@ -2441,7 +2369,7 @@ def process_admin_close_queue_reason_step(message):
     bot.send_message(
         message.chat.id,
         f"🔴 <b>Бугунги қабул вақтинча ёпилди!</b>\n\n"
-        f"Сабаб: <i>{reason}</i>\n"
+        f"Сабаб: <i>{esc(reason)}</i>\n"
         "Mini App'да фуқароларга бу ҳақда махсус огоҳлантириш чиқади.",
         parse_mode="HTML"
     )
@@ -2456,7 +2384,7 @@ def process_admin_set_queue_hours_step(message):
     database.set_setting("queue_hours", new_hours, "Қабул соатлари")
     bot.send_message(
         message.chat.id,
-        f"✅ <b>Қабул соатлари янгиланди:</b> <code>{new_hours}</code>",
+        f"✅ <b>Қабул соатлари янгиланди:</b> <code>{esc(new_hours)}</code>",
         parse_mode="HTML"
     )
     show_admin_settings_panel(message.chat.id)
@@ -2475,10 +2403,10 @@ def handle_admin_panel_callbacks(call):
     # Fuqaro shaxsini tasdiqlash / rad etish
     if action.startswith("adm_appr_cit_"):
         target_uid = action.replace("adm_appr_cit_", "")
-        update_citizen_status(target_uid, "Tasdiqlangan")
+        database.update_citizen_status(target_uid, "Tasdiqlangan")
         try:
             bot.edit_message_text(
-                call.message.text + "\n\n✅ <b>ADMIN TOMONIDAN TASDIQLANDI</b>",
+                esc(call.message.text or "") + "\n\n✅ <b>ADMIN TOMONIDAN TASDIQLANDI</b>",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode="HTML",
@@ -2499,10 +2427,10 @@ def handle_admin_panel_callbacks(call):
 
     elif action.startswith("adm_rejc_cit_"):
         target_uid = action.replace("adm_rejc_cit_", "")
-        update_citizen_status(target_uid, "Rad etilgan")
+        database.update_citizen_status(target_uid, "Rad etilgan")
         try:
             bot.edit_message_text(
-                call.message.text + "\n\n❌ <b>ADMIN TOMONIDAN RAD ETILDI</b>",
+                esc(call.message.text or "") + "\n\n❌ <b>ADMIN TOMONIDAN RAD ETILDI</b>",
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode="HTML",
@@ -2630,7 +2558,7 @@ def handle_admin_panel_callbacks(call):
         else:
             database.set_setting("queue_open", "1", "Электрон навбат ҳолати")
             database.set_setting("queue_closed_reason", "", "Қабул ёпилиш сабаби")
-            bot.answer_callback_query(call.id, "🟢 Қабул қайта очилди!")
+            bot.send_message(call.message.chat.id, "🟢 Қабул қайта очилди!")
             show_admin_settings_panel(call.message.chat.id, call.message.message_id)
 
     elif action == "adm_set_queue_hours":
@@ -2862,29 +2790,7 @@ def handle_admin_panel_callbacks(call):
         threading.Thread(target=_trigger_restart, daemon=True).start()
 
     elif action == "adm_stats":
-        with excel_lock:
-            df_u = pd.read_excel(EXCEL_FILE, dtype=str).fillna("")
-            df_m = pd.read_excel(MUROJAAT_FILE, dtype=str).fillna("")
-            df_n = pd.read_excel(NAVBAT_FILE, dtype=str).fillna("")
-
-        tasdiqlangan = len(df_u[df_u["Status"] == "Tasdiqlangan"])
-        kutayotgan_user = len(df_u[df_u["Status"].str.contains("Kutmoqda", case=False, na=False)])
-        jami_murojaat = len(df_m)
-        ochiq_murojaat = len(df_m[df_m["Status"].str.contains("Kutmoqda|yo'naltirilgan", case=False, na=False)])
-        shoshilinch_m = len(df_m[df_m["Muhimlik"] == "SHOSHILINCH"])
-        faol_navbat = len(df_n[df_n["Status"] == "Band qilingan"])
-
-        stat_text = (
-            "📊 <b>TIZIMNING JORIY STATISTIKASI</b>\n\n"
-            f"👥 <b>Ro'yxatdan o'tgan fuqarolar:</b> {len(df_u)} ta\n"
-            f"✅ <b>Tasdiqlangan fuqarolar:</b> {tasdiqlangan} ta\n"
-            f"⏳ <b>Tasdiq kutayotganlar:</b> {kutayotgan_user} ta\n\n"
-            f"📨 <b>Jami kelib tushgan murojaatlar:</b> {jami_murojaat} ta\n"
-            f"🚨 <b>Shoshilinch (qizil) murojaatlar:</b> {shoshilinch_m} ta\n"
-            f"🕒 <b>Ko'rib chiqilishi kerak bo'lgan murojaatlar:</b> {ochiq_murojaat} ta\n"
-            f"📅 <b>Qabulga yozilgan faol navbatlar:</b> {faol_navbat} ta"
-        )
-        bot.send_message(call.message.chat.id, stat_text, parse_mode="HTML")
+        bot.send_message(call.message.chat.id, format_system_stats_html(), parse_mode="HTML")
 
     elif action == "adm_search_user":
         msg = bot.send_message(
@@ -2895,20 +2801,16 @@ def handle_admin_panel_callbacks(call):
         bot.register_next_step_handler(msg, process_admin_search_step)
 
     elif action == "adm_pending":
-        with excel_lock:
-            df_m = pd.read_excel(MUROJAAT_FILE, dtype=str).fillna("")
-
-        pending = df_m[df_m["Status"].isin(["Kutmoqda", "Tegishli tashkilotga yo'naltirilgan"])].tail(10)
-        if pending.empty:
+        pending = database.get_pending_appeals(limit=10)
+        if not pending:
             bot.send_message(call.message.chat.id, "✅ Hozirda ko'rib chiqilmagan ochiq murojaatlar yo'q!")
             return
 
-        pending_sorted = pending.sort_values(by="Muhimlik", ascending=False)
-        for _, row in pending_sorted.iterrows():
+        for row in pending:
             m_id = row["Murojaat_ID"]
             badge = "🚨 SHOSHILINCH" if row["Muhimlik"] == "SHOSHILINCH" else "⏳ KUTMOQDA"
             kocha = row.get("Kocha_Manzil") or "Ko'rsatilmagan"
-            raw_q = row.get("Savol", "")
+            raw_q = row.get("Savol") or ""
             q_prev = (raw_q[:1200] + "...") if len(raw_q) > 1200 else raw_q
             txt = (
                 f"{badge} | <b>ID: {esc(m_id)}</b> ({esc(row['Sana'])})\n"
@@ -2947,14 +2849,12 @@ def handle_admin_panel_callbacks(call):
                 )
 
     elif action == "adm_queues":
-        with excel_lock:
-            df_n = pd.read_excel(NAVBAT_FILE, dtype=str).fillna("")
-        active_q = df_n[df_n["Status"] == "Band qilingan"].tail(15)
-        if active_q.empty:
+        active_q = database.get_active_navbatlar(limit=15)
+        if not active_q:
             bot.send_message(call.message.chat.id, "📅 Hozirda qabulga yozilgan faol navbatlar yo'q.")
             return
         lines = ["📅 <b>QABULGA YOZILGAN FUQAROLAR RO'YXATI:</b>\n"]
-        for _, r in active_q.iterrows():
+        for r in active_q:
             lines.append(
                 f"🎟 <b>{esc(r['Navbat_ID'])}</b> — <b>{esc(r['Qabul_Kuni'])} | {esc(r['Qabul_Soati'])}</b>\n"
                 f"👤 {esc(r['FIO'])} ({esc(r['Telefon'])}) — {esc(r['Kocha_Manzil'])}"
@@ -2971,10 +2871,8 @@ def handle_admin_panel_callbacks(call):
         bot.register_next_step_handler(msg, process_broadcast_all_step)
 
     elif action == "adm_broadcast_area":
-        with excel_lock:
-            df_u = pd.read_excel(EXCEL_FILE, dtype=str).fillna("")
-        kochalar = [k for k in df_u["Kocha_Manzil"].unique().tolist() if k.strip()]
-        kocha_namuna = ", ".join(kochalar[:8]) if kochalar else "Hozircha ko'chalar kiritilmagan"
+        kochalar = database.get_known_addresses(limit=8)
+        kocha_namuna = ", ".join(kochalar) if kochalar else "Hozircha ko'chalar kiritilmagan"
 
         msg = bot.send_message(
             call.message.chat.id,
@@ -2989,29 +2887,46 @@ def handle_admin_panel_callbacks(call):
         generate_monthly_ai_report(call.message.chat.id, datetime.now().strftime("%m-%Y"))
 
     elif action == "adm_download_excel":
-        bot.answer_callback_query(call.id, "Excel hisoboti shakllantirilmoqda...")
-        report_path = database.export_all_to_excel()
-        if report_path and os.path.exists(report_path):
-            try:
-                with open(report_path, "rb") as f_obj:
-                    bot.send_document(
-                        call.message.chat.id,
-                        f_obj,
-                        caption="📊 <b>Shayx-Ali MFY to'liq Excel hisoboti</b>\n(Fuqarolar, Murojaatlar, Navbatlar va CSAT baholari)",
-                        parse_mode="HTML",
-                    )
-            except Exception as e:
-                bot.send_message(call.message.chat.id, f"⚠️ Fayl yuborishda xatolik: {e}")
-        else:
-            with excel_lock:
-                for fpath, cap in [
-                    (EXCEL_FILE, "📁 Fuqarolar bazasi (fuqarolar.xlsx)"),
-                    (MUROJAAT_FILE, "📁 Murojaatlar bazasi (murojaatlar.xlsx)"),
-                    (NAVBAT_FILE, "📁 Elektron navbatlar bazasi (navbatlar.xlsx)"),
-                ]:
-                    if os.path.exists(fpath):
-                        with open(fpath, "rb") as f_obj:
-                            bot.send_document(call.message.chat.id, f_obj, caption=cap)
+        send_full_excel_report(call.message.chat.id)
+
+
+def format_system_stats_html() -> str:
+    """Admin paneli va tezkor tugma uchun yagona statistika matni (faqat SQLite dan)."""
+    s = database.get_system_stats()
+    return (
+        "📊 <b>ТИЗИМНИНГ ЖОРИЙ СТАТИСТИКАСИ</b>\n\n"
+        f"👥 <b>Рўйхатдан ўтган фуқаролар:</b> {s['fuqarolar_jami']} та\n"
+        f"✅ <b>Тасдиқланган фуқаролар:</b> {s['tasdiqlangan']} та\n"
+        f"⏳ <b>Тасдиқ кутаётганлар:</b> {s['tasdiq_kutayotgan']} та\n\n"
+        f"📨 <b>Жами келиб тушган мурожаатлар:</b> {s['murojaatlar_jami']} та\n"
+        f"🚨 <b>Очиқ шошилинч мурожаатлар:</b> {s['shoshilinch']} та\n"
+        f"🕒 <b>Кўриб чиқилиши керак бўлган мурожаатлар:</b> {s['ochiq_murojaatlar']} та\n"
+        f"📅 <b>Қабулга ёзилган фаол навбатлар:</b> {s['faol_navbatlar']} та"
+    )
+
+
+def send_full_excel_report(chat_id):
+    """To'liq Excel hisobotini adminga yuboradi va serverdagi nusxasini o'chiradi (ichida shaxsiy ma'lumot bor)."""
+    report_path = database.export_all_to_excel()
+    if not report_path or not os.path.exists(report_path):
+        bot.send_message(chat_id, "⚠️ Excel ҳисоботини шакллантириб бўлмади.")
+        return
+    try:
+        with open(report_path, "rb") as f_obj:
+            bot.send_document(
+                chat_id,
+                f_obj,
+                caption="📊 <b>Shayx-Ali MFY to'liq Excel hisoboti</b>\n(Fuqarolar, Murojaatlar, Navbatlar va CSAT baholari)",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        print("Excel hisobotini yuborishda xatolik:", e)
+        bot.send_message(chat_id, "⚠️ Файлни юборишда хатолик юз берди.")
+    finally:
+        try:
+            os.remove(report_path)
+        except OSError as e:
+            print("Excel hisobot nusxasini o'chirib bo'lmadi:", e)
 
 
 def process_broadcast_all_step(message):
@@ -3047,19 +2962,11 @@ def process_broadcast_area_text_step(message):
 
 
 def send_broadcast_to_users(admin_chat_id, text_body: str, area_filter=None):
-    with excel_lock:
-        df_u = pd.read_excel(EXCEL_FILE, dtype=str).fillna("")
-
-    df_target = df_u[df_u["Status"] == "Tasdiqlangan"]
-    if area_filter:
-        mask = (
-            df_target["Kocha_Manzil"].str.contains(area_filter, case=False, na=False)
-            | df_target["Manzil_Geolokatsiya"].str.contains(area_filter, case=False, na=False)
-        )
-        df_target = df_target[mask]
+    targets = database.get_verified_citizens(area_filter=area_filter)
 
     sent_count = 0
-    for _, row in df_target.iterrows():
+    failed_count = 0
+    for row in targets:
         tg_id = row.get("Telegram_ID", "")
         if tg_id:
             try:
@@ -3069,12 +2976,15 @@ def send_broadcast_to_users(admin_chat_id, text_body: str, area_filter=None):
                     parse_mode="HTML",
                 )
                 sent_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                failed_count += 1
+                print(f"E'lon {tg_id} ga yetmadi:", e)
+            time.sleep(0.05)  # Telegram ommaviy xabar limiti: ~20-30 xabar/soniya
 
+    failed_note = f"\n⚠️ Yetkazilmadi: <b>{failed_count}</b> nafar" if failed_count else ""
     bot.send_message(
         admin_chat_id,
-        f"✅ Xabarnoma jami <b>{sent_count}</b> nafar fuqaroga muvaffaqiyatli yetkazildi!",
+        f"✅ Xabarnoma jami <b>{sent_count}</b> nafar fuqaroga muvaffaqiyatli yetkazildi!{failed_note}",
         parse_mode="HTML",
     )
 
@@ -3102,10 +3012,10 @@ def handle_murojaat_status_callbacks(call):
         return
 
     _, action, murojaat_id = call.data.split("_", 2)
-    bot.answer_callback_query(call.id)
+    # Har bir callback ga faqat bir marta javob berish mumkin
+    bot.answer_callback_query(call.id, "📄 Dalolatnoma tayyorlanmoqda..." if action == "doc" else None)
 
     if action == "doc":
-        bot.answer_callback_query(call.id, "📄 Dalolatnoma tayyorlanmoqda...")
         docx_path = database.generate_dalolatnoma_docx(murojaat_id)
         if docx_path and os.path.exists(docx_path):
             try:
@@ -3209,7 +3119,7 @@ def process_admin_direct_reply(message):
             cit_fio = updated_row.get("FIO") or "Фуқаро"
             reply_text = (
                 f"👨‍💼 <b>Шайх-Али МФЙ ижтимоий ходими (А. Жўраев) жавоби:</b>\n\n"
-                f"{javob_matni}\n\n"
+                f"{esc(javob_matni)}\n\n"
                 f"📌 <i>Мурожаат рақами: #{esc(murojaat_id)}</i>"
             )
             send_split_message(
@@ -3229,7 +3139,11 @@ def handle_csat_callback(call):
         try:
             score = int(parts[2])
         except ValueError:
-            score = 5
+            score = 0
+        appeal = database.get_murojaat_by_id(murojaat_id)
+        if not 1 <= score <= 5 or not appeal or str(appeal.get("Telegram_ID")) != str(call.from_user.id):
+            bot.answer_callback_query(call.id, "⚠️ Baholash imkoni yo'q.", show_alert=True)
+            return
         database.save_murojaat_rating(murojaat_id, score)
         bot.answer_callback_query(call.id, f"Bahoyingiz qabul qilindi: {score} ⭐")
         stars_str = "⭐" * score
@@ -3251,6 +3165,60 @@ def handle_csat_callback(call):
 # ==============================================================================
 # 12. FUQARO SAVOLLARINI TAHLIL QILISH VA ADMINGA YO'NALTIRISH (SMART PRIORITET)
 # ==============================================================================
+def generate_grounded_ai_output(question: str, lang: str) -> str:
+    """
+    Savolni hujjatlar bazasiga tayangan holda AI ga yuboradi va teglangan xom javobni qaytaradi.
+    AI ishlamasa, savol ijtimoiy xodim navbatiga tushadigan (SHAXSIY_MUROJAAT) javob qaytadi.
+    """
+    toza_savol = tozalash_regex(question)
+    # Fuqaro kirillda yozgan bo'lsa ham, qidiruv aniqligi uchun lotinga o'giramiz
+    toza_savol_lat = cyrillic_to_latin_uz(toza_savol)
+    top_legal_chunks = search_knowledge_base(toza_savol_lat, top_k=2)
+    legal_context = format_legal_grounding_prompt(toza_savol, top_legal_chunks)
+
+    if lang == "ru":
+        lang_instruction = "\n[Tizim eslatmasi: Fuqaroga javobni RUS tilida yoz!]"
+    else:
+        lang_instruction = (
+            "\n[Тизим эслатмаси: Фуқаро саволини қайси ёзувда (кирилл ёки лотин) берганидан қатъи назар, "
+            "жавобни ФАҚАТ ЎЗБЕК КИРИЛЛ АЛИФБОСИДА (Ў, Қ, Ғ, Ҳ ҳарфлари билан), "
+            "имло меъёрларига риоя қилган ҳолда ёз! Ҳеч қандай лотин ҳарфларини аралаштирма!]"
+        )
+
+    try:
+        return call_ai_strict(toza_savol + legal_context + lang_instruction).text or ""
+    except Exception as e:
+        print("AI xatosi, zaxira javobga o'tilmoqda:", e)
+
+    # AI javob bermadi: savol yo'qolmasligi uchun ijtimoiy xodim ko'rib chiqadigan murojaat bo'ladi
+    if top_legal_chunks:
+        c = top_legal_chunks[0]
+        fb_text = (
+            f"📜 <b>Rasmiy hujjatdan havola ({esc(c.get('filename'))}):</b>\n\n"
+            f"{esc(c.get('content'))}\n\n"
+            "<i>Savolingiz bo'yicha amaliy yordam olish uchun ijtimoiy xodimga (+998 91 454 53 51) murojaat qiling.</i>"
+        )
+    else:
+        fb_text = (
+            "📨 <b>Мурожаатингиз қабул қилинди!</b>\n"
+            "Ушбу масала бўйича Шайх-Али МФЙ ижтимоий ходими (А. Жўраев) сиз билан тез орада боғланади.\n"
+            "📞 Телефон: <b>+998 91 454 53 51</b>"
+        )
+    return f"[TURI: SHAXSIY_MUROJAAT]\n[MUHIMLIK: ODDIY]\n---\n{fb_text}"
+
+
+def answer_citizen_question(question: str, user_id, lang: str) -> dict:
+    """Mini App suhbati uchun bot bilan bir xil javob oqimi: avval mahalliy baza, keyin hujjatga tayangan AI."""
+    handled, turi, muhimlik, answer = try_local_answer(question, user_id)
+    source = "local"
+    if not handled:
+        source = "ai"
+        turi, muhimlik, answer = parse_ai_output(generate_grounded_ai_output(question, lang), question)
+    if lang != "ru":
+        answer = latin_to_cyrillic_uz(answer)
+    return {"turi": turi, "muhimlik": muhimlik, "answer": answer, "source": source}
+
+
 def process_and_dispatch_question(message, citizen: dict, original_question: str, ai_raw_output: str = None, force_personal: bool = False, progress_msg_id: int = None):
     """
     Fuqaro savolini tahlil qiladi.
@@ -3272,42 +3240,7 @@ def process_and_dispatch_question(message, citizen: dict, original_question: str
             ai_raw_output = f"[TURI: {turi}]\n[MUHIMLIK: {muhimlik}]\n---\n{loc_ans}"
 
     if ai_raw_output is None:
-        toza_savol = tozalash_regex(original_question)
-        # Fuqaro kirillda yozgan bo'lsa ham, qidiruv aniqligi uchun lotinga o'giramiz
-        toza_savol_lat = cyrillic_to_latin_uz(toza_savol)
-        top_legal_chunks = search_knowledge_base(toza_savol_lat, top_k=2)
-        legal_context = format_legal_grounding_prompt(toza_savol_lat, top_legal_chunks)
-
-        if lang == "ru":
-            lang_instruction = "\n[Tizim eslatmasi: Fuqaroga javobni RUS tilida yoz!]"
-        else:
-            lang_instruction = (
-                "\n[Тизим эслатмаси: Фуқаро саволини қайси ёзувда (кирилл ёки лотин) берганидан қатъи назар, "
-                "жавобни ФАҚАТ ЎЗБЕК КИРИЛЛ АЛИФБОСИДА (Ў, Қ, Ғ, Ҳ ҳарфлари билан), "
-                "имло меъёрларига риоя қилган ҳолда ёз! Ҳеч қандай лотин ҳарфларини аралаштирма!]"
-            )
-
-        full_prompt = toza_savol_lat + legal_context + lang_instruction
-        try:
-            response = call_gemini_safe(full_prompt)
-            ai_raw_output = response.text or ""
-        except Exception as e:
-            print("Gemini AI xatosi, zaxira huquqiy xulosaga o'tilmoqda:", e)
-            if top_legal_chunks:
-                c = top_legal_chunks[0]
-                fb_text = (
-                    f"📜 <b>Rasmiy hujjatdan havola ({esc(c.get('filename'))}):</b>\n\n"
-                    f"{esc(c.get('content'))}\n\n"
-                    "<i>Savolingiz bo'yicha amaliy yordam olish uchun ijtimoiy xodimga (+998 91 454 53 51) murojaat qiling.</i>"
-                )
-                ai_raw_output = f"[TURI: QONUNIY_MASLAHAT]\n[MUHIMLIK: ORTA]\n---\n{fb_text}"
-            else:
-                fb_text = (
-                    "📨 <b>Мурожаатингиз қабул қилинди!</b>\n"
-                    "Ушбу масала бўйича Шайх-Али МФЙ ижтимоий ходими (А. Жўраев) сиз билан тез орада боғланади.\n"
-                    "📞 Телефон: <b>+998 91 454 53 51</b>"
-                )
-                ai_raw_output = f"[TURI: SHAXSIY_MUROJAAT]\n[MUHIMLIK: ODDIY]\n---\n{fb_text}"
+        ai_raw_output = generate_grounded_ai_output(original_question, lang)
 
     if not is_local_handled:
         turi, muhimlik, ai_javobi = parse_ai_output(ai_raw_output, original_question)
@@ -3374,7 +3307,7 @@ def process_and_dispatch_question(message, citizen: dict, original_question: str
         and citizen.get("FIO")
         and str(citizen.get("FIO")).strip() not in ["Noma'lum", "Nomalum", "Hurmatli fuqaro", "Fuqaro", ""]
     )
-    q_preview = original_question if len(original_question) <= 1500 else (original_question[:1500] + "\n... (savolning to'liq qismi Excelda)")
+    q_preview = original_question if len(original_question) <= 1500 else (original_question[:1500] + "\n... (savolning to'liq qismi bazada)")
 
     if not is_verified:
         # Identifikatsiyadan o'tmagan fuqaro murojaati (Ortiqcha "Nomalum" qatorlarisiz ixcham format)
@@ -3481,6 +3414,19 @@ def handle_set_language_callback(call):
 
 # --- 2) QABULGA ONLAYN YOZILISH (ELEKTRON NAVBAT) ---
 def show_queue_days_menu(chat_id, user_id):
+    if str(database.get_setting("queue_open", "1")) != "1":
+        reason = database.get_setting("queue_closed_reason", "") or ""
+        bot.send_message(
+            chat_id,
+            localize_text(
+                user_id,
+                f"🔴 <b>Қабулга ёзилиш вақтинча ёпиқ.</b>\n\n{esc(reason)}",
+                f"🔴 <b>Запись на приём временно закрыта.</b>\n\n{esc(reason)}",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
     markup = types.InlineKeyboardMarkup(row_width=2)
     today = datetime.now()
     added = 0
@@ -3515,13 +3461,11 @@ def handle_queue_day_select(call):
     bot.answer_callback_query(call.id)
 
     slots = ["09:00 - 10:00", "10:00 - 11:00", "11:00 - 12:00", "14:00 - 15:00", "15:00 - 16:00", "16:00 - 17:00"]
-    with excel_lock:
-        df_n = pd.read_excel(NAVBAT_FILE, dtype=str).fillna("")
-    booked = df_n[(df_n["Qabul_Kuni"] == q_day) & (df_n["Status"] == "Band qilingan")]["Qabul_Soati"].tolist()
+    booked = database.get_booked_slots(q_day)
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     for s in slots:
-        if s in booked:
+        if database.normalize_time_slot(s) in booked:
             markup.add(types.InlineKeyboardButton(f"❌ {s} (Band)", callback_data="qslot_busy"))
         else:
             markup.add(types.InlineKeyboardButton(f"🕒 {s}", callback_data=f"qslot_{q_day}_{s}"))
@@ -3549,31 +3493,23 @@ def handle_queue_slot_select(call):
     _, q_day, q_time = call.data.split("_", 2)
     citizen = get_citizen_by_tg_id(user_id) or {}
 
-    with excel_lock:
-        df_n = pd.read_excel(NAVBAT_FILE, dtype=str).fillna("")
-        already = df_n[(df_n["Qabul_Kuni"] == q_day) & (df_n["Qabul_Soati"] == q_time) & (df_n["Status"] == "Band qilingan")]
-        if not already.empty:
-            bot.answer_callback_query(call.id, "⚠️ Bu vaqt hozirgina band qilindi!", show_alert=True)
-            return
+    if str(database.get_setting("queue_open", "1")) != "1":
+        bot.answer_callback_query(call.id, "🔴 Qabulga yozilish vaqtincha yopiq.", show_alert=True)
+        return
 
-        navbat_id = f"N-{101 + len(df_n)}"
-        yangi_n = pd.DataFrame(
-            [
-                {
-                    "Navbat_ID": navbat_id,
-                    "Yaratilgan_Vaqt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Telegram_ID": str(user_id),
-                    "FIO": citizen.get("FIO", "Noma'lum"),
-                    "Telefon": citizen.get("Telefon", "Noma'lum"),
-                    "Kocha_Manzil": citizen.get("Kocha_Manzil", "Noma'lum"),
-                    "Qabul_Kuni": q_day,
-                    "Qabul_Soati": q_time,
-                    "Status": "Band qilingan",
-                }
-            ]
+    # Bot va Mini App bitta navbat jadvalidan foydalanadi: band vaqtni baza atomik tekshiradi
+    try:
+        navbat_id = database.save_navbat(
+            telegram_id=user_id,
+            fio=citizen.get("FIO") or "Noma'lum",
+            telefon=citizen.get("Telefon") or "Noma'lum",
+            kocha=citizen.get("Kocha_Manzil") or "Noma'lum",
+            qabul_kuni=q_day,
+            qabul_soati=q_time,
         )
-        df_n = pd.concat([df_n, yangi_n], ignore_index=True)
-        df_n.to_excel(NAVBAT_FILE, index=False)
+    except ValueError as e:
+        bot.answer_callback_query(call.id, f"⚠️ {str(e)[:180]}", show_alert=True)
+        return
 
     bot.answer_callback_query(call.id, "✅ Qabulga yozildingiz!")
     bot.edit_message_text(
@@ -3612,43 +3548,31 @@ def handle_queue_slot_select(call):
 
 # --- 3) MUDDATI O'TAYOTGAN MUROJAATLAR ESLATMASI (SLA > 24 SOAT) ---
 def check_overdue_appeals(notify_admin: bool = True):
-    """24 soatdan beri 'Kutmoqda' bo'lib turgan murojaatlarni topadi va Adminga eslatma yuboradi."""
-    overdue_items = []
-    now = datetime.now()
-    with excel_lock:
-        try:
-            df_m = pd.read_excel(MUROJAAT_FILE, dtype=str).fillna("")
-            if "Eslatma_Yuborildi" not in df_m.columns:
-                df_m["Eslatma_Yuborildi"] = "Yo'q"
-            changed = False
-            for idx, row in df_m.iterrows():
-                if row.get("Status") == "Kutmoqda":
-                    try:
-                        dt = datetime.strptime(row.get("Sana", ""), "%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        continue
-                    if (now - dt).total_seconds() >= 24 * 3600:
-                        overdue_items.append(row.to_dict())
-                        if notify_admin and row.get("Eslatma_Yuborildi") != "Ha":
-                            m_id = row.get("Murojaat_ID")
-                            try:
-                                bot.send_message(
-                                    ADMIN_ID,
-                                    f"⏰ <b>ESLATMA: Murojaatga 24 soatdan beri javob berilmadi!</b>\n\n"
-                                    f"🆔 <b>ID:</b> {esc(m_id)} ({esc(row.get('Sana'))})\n"
-                                    f"👤 <b>Fuqaro:</b> {esc(row.get('FIO'))} ({esc(row.get('Telefon'))})\n"
-                                    f"❓ <b>Savol:</b> {esc(row.get('Savol'))}",
-                                    reply_markup=get_murojaat_admin_buttons(m_id),
-                                    parse_mode="HTML",
-                                )
-                                df_m.at[idx, "Eslatma_Yuborildi"] = "Ha"
-                                changed = True
-                            except Exception:
-                                pass
-            if changed:
-                df_m.to_excel(MUROJAAT_FILE, index=False)
-        except Exception as e:
-            print("SLA tekshiruvida xatolik:", e)
+    """24 soatdan beri ochiq turgan murojaatlarni topadi va Adminga eslatma yuboradi."""
+    try:
+        overdue_items = database.get_overdue_appeals(hours=24)
+    except Exception as e:
+        print("SLA tekshiruvida xatolik:", e)
+        return []
+
+    if notify_admin:
+        for row in overdue_items:
+            if row.get("Eslatma_Yuborildi") == "Ha":
+                continue
+            m_id = row.get("Murojaat_ID")
+            try:
+                bot.send_message(
+                    ADMIN_ID,
+                    f"⏰ <b>ESLATMA: Murojaatga 24 soatdan beri javob berilmadi!</b>\n\n"
+                    f"🆔 <b>ID:</b> {esc(m_id)} ({esc(row.get('Sana'))})\n"
+                    f"👤 <b>Fuqaro:</b> {esc(row.get('FIO'))} ({esc(row.get('Telefon'))})\n"
+                    f"❓ <b>Savol:</b> {esc((row.get('Savol') or '')[:1500])}",
+                    reply_markup=get_murojaat_admin_buttons(m_id),
+                    parse_mode="HTML",
+                )
+                database.mark_appeal_reminder_sent(m_id)
+            except Exception as e:
+                print("SLA eslatmasini yuborishda xatolik:", e)
     return overdue_items
 
 
@@ -3657,6 +3581,16 @@ def sla_background_worker():
     while True:
         time.sleep(3600)
         check_overdue_appeals(notify_admin=True)
+
+
+def backup_background_worker():
+    """Bazaning kunlik zaxirasini oladi; eski zaxiralarni backup_database() o'zi tozalaydi."""
+    while True:
+        try:
+            database.backup_if_due(max_age_hours=24)
+        except Exception as e:
+            print("Avtomatik zaxira olishda xatolik:", e)
+        time.sleep(6 * 3600)
 
 
 # --- 4) NAFAQA VA BOLA PULI KALKULYATORI (SHAXSIY MA'LUMOTSIZ VA AI'SIZ) ---
@@ -4339,43 +4273,17 @@ def handle_user_questions(message):
             return
 
         if text in ["📊 Статистика", "статистика"]:
-            with excel_lock:
-                df_u = pd.read_excel(EXCEL_FILE, dtype=str).fillna("")
-                df_m = pd.read_excel(MUROJAAT_FILE, dtype=str).fillna("")
-                df_n = pd.read_excel(NAVBAT_FILE, dtype=str).fillna("")
-
-            tasdiqlangan = len(df_u[df_u["Status"] == "Tasdiqlangan"])
-            kutayotgan_user = len(df_u[df_u["Status"].str.contains("Kutmoqda", case=False, na=False)])
-            jami_murojaat = len(df_m)
-            ochiq_murojaat = len(df_m[df_m["Status"].str.contains("Kutmoqda|yo'naltirilgan", case=False, na=False)])
-            shoshilinch_m = len(df_m[df_m["Muhimlik"] == "SHOSHILINCH"])
-            faol_navbat = len(df_n[df_n["Status"] == "Band qilingan"])
-
-            stat_text = (
-                "📊 <b>ТИЗИМНИНГ ЖОРИЙ СТАТИСТИКАСИ</b>\n\n"
-                f"👥 <b>Рўйхатдан ўтган фуқаролар:</b> {len(df_u)} та\n"
-                f"✅ <b>Тасдиқланган фуқаролар:</b> {tasdiqlangan} та\n"
-                f"⏳ <b>Тасдиқ кутаётганлар:</b> {kutayotgan_user} та\n\n"
-                f"📨 <b>Жами келиб тушган мурожаатлар:</b> {jami_murojaat} та\n"
-                f"🚨 <b>Шошилинч мурожаатлар:</b> {shoshilinch_m} та\n"
-                f"🕒 <b>Кўриб чиқилиши керак бўлган мурожаатлар:</b> {ochiq_murojaat} та\n"
-                f"📅 <b>Қабулга ёзилган фаол навбатлар:</b> {faol_navbat} та"
-            )
-            bot.send_message(chat_id, stat_text, parse_mode="HTML")
+            bot.send_message(chat_id, format_system_stats_html(), parse_mode="HTML")
             return
 
         if text in ["🔍 Фуқарони қидириш", "фуқарони қидириш"]:
             msg = bot.send_message(chat_id, "🔍 <b>Қидирилаётган фуқаро исми, фамилияси, ЖШШИР ёки кўча номини киритинг:</b>", parse_mode="HTML")
-            bot.register_next_step_handler(msg, process_search_query_step)
+            bot.register_next_step_handler(msg, process_admin_search_step)
             return
 
         if text in ["📥 Excel базани юклаш", "excel юклаш"]:
-            export_all_to_excel()
-            bot.send_message(chat_id, "📥 <b>Excel базалар шакллантирилмоқда...</b>", parse_mode="HTML")
-            for fpath, fname in [(EXCEL_FILE, "fuqarolar.xlsx"), (MUROJAAT_FILE, "murojaatlar.xlsx"), (NAVBAT_FILE, "navbatlar.xlsx")]:
-                if os.path.exists(fpath):
-                    with open(fpath, "rb") as ef:
-                        bot.send_document(chat_id, ef, caption=f"📄 {fname}")
+            bot.send_message(chat_id, "📥 <b>Excel ҳисоботи шакллантирилмоқда...</b>", parse_mode="HTML")
+            send_full_excel_report(chat_id)
             return
 
     # Bekor qilish tugmasi bosilganda asosiy menyuni chiqarish
@@ -4501,7 +4409,7 @@ def handle_user_questions(message):
 
     # 7. "Murojaatim holati" tugmasi bosilganda — Status tracking
     if text in ["🔍 Murojaatim holati", "🔍 Мурожаатим ҳолати", "🔍 Статус обращения"]:
-        user_appeals = get_citizen_appeals(user_id, limit=5)
+        user_appeals = database.get_citizen_appeals(user_id, limit=5)
         if not user_appeals:
             bot.send_message(
                 message.chat.id,
@@ -4517,8 +4425,8 @@ def handle_user_questions(message):
         status_lines = ["🔍 <b>СИЗНИНГ ОХИРГИ МУРОЖААТЛАРИНГИЗ ҲОЛАТИ:</b>\n"]
         for row in user_appeals:
             st = esc(row.get("Status", "Кутмоқда"))
-            izoh = esc(row.get("Admin_Izohi", ""))
-            raw_savol = row.get("Savol", "")
+            izoh = esc(row.get("Admin_Izohi") or "")
+            raw_savol = row.get("Savol") or ""
             savol_qisqa = esc((raw_savol[:70] + "...") if len(raw_savol) > 70 else raw_savol)
             block = (
                 f"🆔 <b>{esc(row.get('Murojaat_ID'))}</b> ({esc(row.get('Sana'))})\n"
@@ -4660,28 +4568,33 @@ def auto_ensure_tunnel(port=5001):
         return WEB_APP_URL
 
     try:
-        import subprocess, re, time
+        import subprocess
 
         if _cf_process and _cf_process.poll() is None:
             try:
                 _cf_process.terminate()
+                _cf_process.wait(timeout=5)
             except Exception:
-                pass
+                _cf_process.kill()
 
-        cmd = [cf_bin, "tunnel", "--url", f"http://localhost:{port}"]
+        cmd = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{port}"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         _cf_process = proc
 
-        start_t = time.time()
-        new_url = None
-        while time.time() - start_t < 25:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
-            if m:
-                new_url = m.group(0)
-                break
+        found = {}
+        url_found = threading.Event()
+
+        def _drain_tunnel_output():
+            # Quvur to'lib qolsa cloudflared to'xtab qoladi, shuning uchun chiqishni oxirigacha o'qiymiz
+            for line in proc.stdout:
+                m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+                if m and "url" not in found:
+                    found["url"] = m.group(0)
+                    url_found.set()
+
+        threading.Thread(target=_drain_tunnel_output, daemon=True).start()
+        url_found.wait(timeout=25)
+        new_url = found.get("url")
 
         if new_url:
             WEB_APP_URL = new_url
@@ -4719,11 +4632,16 @@ if __name__ == "__main__":
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
 
     # Telegram Mini App (Flask REST API va WebApp Server) ni orqa fonda ishga tushirish
+    _setup_file_logging()
     tma_port = int(os.getenv("PORT", 5001))
+    # cloudflared serverga mahalliy ulanadi: tashqi tarmoqqa ochish uchun WEBAPP_HOST=0.0.0.0 bering
+    tma_host = os.getenv("WEBAPP_HOST", "127.0.0.1").strip() or "127.0.0.1"
     try:
         import webapp_server
-        webapp_server.start_server_in_background(host="0.0.0.0", port=tma_port, bot=bot)
-        print(f"🌐 Telegram Mini App serveri fon rejimida faol: http://0.0.0.0:{tma_port}")
+        webapp_server.set_ai_backend(answer_citizen_question)
+        webapp_server.set_lang_change_listener(user_lang_cache.__setitem__)
+        webapp_server.start_server_in_background(host=tma_host, port=tma_port, bot=bot)
+        print(f"🌐 Telegram Mini App serveri fon rejimida faol: http://{tma_host}:{tma_port}")
     except Exception as ws_err:
         print("⚠️ Mini App serverini ishga tushirishda ogohlantirish:", ws_err)
 
@@ -4756,6 +4674,9 @@ if __name__ == "__main__":
     # Muddati o'tayotgan murojaatlarni har soatda tekshiruvchi orqa fon oqimi
     sla_thread = threading.Thread(target=sla_background_worker, daemon=True)
     sla_thread.start()
+
+    # Bazaning kunlik avtomatik zaxirasi
+    threading.Thread(target=backup_background_worker, daemon=True).start()
 
     print("✅ Shayxali MFY Ijtimoiy Xodim AI Agent boti to'liq ishga tushdi...")
     while True:

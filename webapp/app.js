@@ -375,7 +375,7 @@ function haptic(type = 'light') {
 function initProfile() {
   const nameEl = document.getElementById('citizenName');
   const avatarEl = document.getElementById('userAvatar');
-  if (nameEl) nameEl.textContent = escapeHtml(state.user.first_name);
+  if (nameEl) nameEl.textContent = state.user.first_name;
   if (avatarEl) avatarEl.textContent = (state.user.first_name || "Ф").charAt(0).toUpperCase();
 }
 
@@ -402,7 +402,7 @@ async function loadCitizenData() {
 
         const nameEl = document.getElementById('citizenName');
         const avatarEl = document.getElementById('userAvatar');
-        if (nameEl && state.user.fio) nameEl.textContent = escapeHtml(state.user.fio);
+        if (nameEl && state.user.fio) nameEl.textContent = state.user.fio;
         if (avatarEl && state.user.fio) avatarEl.textContent = state.user.fio.charAt(0).toUpperCase();
 
         // Apply language from database or localStorage
@@ -445,20 +445,20 @@ function checkQueueBanner() {
       banner.id = 'queueClosedBanner';
       banner.className = 'queue-closed-banner';
       banner.style.cssText = 'background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: 12px; padding: 12px; margin-bottom: 14px; color: #fca5a5; font-size: 13px; line-height: 1.4;';
-      const bookingForm = document.getElementById('bookingForm') || document.querySelector('.booking-container') || document.querySelector('.booking-card');
+      const bookingForm = document.querySelector('.queue-card');
       if (bookingForm && bookingForm.parentNode) {
         bookingForm.parentNode.insertBefore(banner, bookingForm);
       }
     }
     banner.innerHTML = `⚠️ <b>Қабул вақтинча тўхтатилган:</b><br>${escapeHtml(reason)}`;
-    const submitBtn = document.getElementById('submitQueueBtn') || document.querySelector('button[onclick*="submitQueue"]');
+    const submitBtn = document.getElementById('confirmBookingBtn');
     if (submitBtn) {
       submitBtn.disabled = true;
       submitBtn.style.opacity = '0.5';
     }
   } else if (banner) {
     banner.remove();
-    const submitBtn = document.getElementById('submitQueueBtn') || document.querySelector('button[onclick*="submitQueue"]');
+    const submitBtn = document.getElementById('confirmBookingBtn');
     if (submitBtn) {
       submitBtn.disabled = false;
       submitBtn.style.opacity = '1';
@@ -468,7 +468,7 @@ function checkQueueBanner() {
 
 // --- LANGUAGE SWITCHING & DOM LOCALIZATION ---
 function applyLanguage(lang) {
-  if (!['uz_cyr', 'uz_cyr', 'ru'].includes(lang)) lang = 'uz_cyr';
+  if (!['uz_cyr', 'ru'].includes(lang)) lang = 'uz_cyr';
   state.lang = lang;
   try { localStorage.setItem('ihma_lang', lang); } catch (e) {}
 
@@ -617,6 +617,7 @@ function updateVerificationBadge(isVerified, status = "") {
   const text = document.getElementById('userStatusText');
   const verifyBtn = document.getElementById('quickVerifyBtn');
   const addressEl = document.getElementById('citizenAddress');
+  const lang = state.lang || 'uz_cyr';
 
   if (addressEl && state.user.address) {
     addressEl.textContent = state.user.address;
@@ -902,8 +903,11 @@ async function sendChatMessage() {
         appendChatMessage(data.reply, 'bot');
         haptic('light');
       } else {
-        appendChatMessage((lang === 'ru' ? 'Извините, произошла ошибка. Пожалуйста, обратитесь к соцработнику.' : 'Кечирасиз, жавоб олишда хатолик юз берди. Илтимос, қайта уриниб кўринг ёки ижтимоий ходимга мурожаат қилинг.'), 'bot');
+        appendChatMessage((state.lang === 'ru' ? 'Извините, произошла ошибка. Пожалуйста, обратитесь к соцработнику.' : 'Кечирасиз, жавоб олишда хатолик юз берди. Илтимос, қайта уриниб кўринг ёки ижтимоий ходимга мурожаат қилинг.'), 'bot');
       }
+    } else if (res.status === 429) {
+      const data = await res.json().catch(() => ({}));
+      appendChatMessage(data.message || (state.lang === 'ru' ? 'Слишком много запросов. Попробуйте через минуту.' : 'Жуда кўп сўров юборилди. Бир дақиқадан сўнг қайта уриниб кўринг.'), 'bot');
     } else {
       fallbackLocalAnswer(text);
     }
@@ -926,7 +930,7 @@ function fallbackLocalAnswer(query) {
     } else if (lower.includes("насили") || lower.includes("притесн") || lower.includes("ордер")) {
       answer = "🚨 **Защита от насилия:**\nСрочно звоните 102 или обратитесь к инспектору профилактики для оформления охранного ордера на 30 дней. Соцработник обеспечит правовую и кризисную поддержку.";
     } else {
-      answer = "Уважаемый гражданин! Ваше обращение принято. Для точной информации отправьте заявку через раздел 'Официальное обращение' или позвоните по номеру: +998 91 454 53 51.";
+      answer = "Уважаемый гражданин! Сервер сейчас недоступен, поэтому ваш вопрос не сохранён. Для точной информации отправьте заявку через раздел 'Официальное обращение' или позвоните по номеру: +998 91 454 53 51.";
     }
   } else {
     // uz_cyr
@@ -937,7 +941,7 @@ function fallbackLocalAnswer(query) {
     } else if (lower.includes("тазйиқ") || lower.includes("зўравонлик") || lower.includes("ҳимоя") || lower.includes("ордер")) {
       answer = "🚨 **Тазйиқ ва зўравонликдан ҳимоя:**\nЗудлик билан 102 ёки ҳудудий профилактика инспекторига хабар беринг. ЎРҚ-561 қонуни асосида 30 кунлик 'Ҳимоя ордери' расмийлаштирилади.";
     } else {
-      answer = "Ҳурматли фуқаро! Мурожаатингиз қабул қилинди. Ушбу масала бўйича аниқ маълумот олиш учун 'Расмий Мурожаат' бўлими орқали Шайх-Али МФЙ ижтимоий ходимига сўров юборишингизни тавсия этамиз.";
+      answer = "Ҳурматли фуқаро! Сервер ҳозир жавоб бермаяпти, шу сабабли саволингиз сақланмади. Ушбу масала бўйича аниқ маълумот олиш учун 'Расмий Мурожаат' бўлими орқали Шайх-Али МФЙ ижтимоий ходимига сўров юборишингизни тавсия этамиз.";
     }
   }
 
@@ -955,7 +959,14 @@ function appendChatMessage(text, sender = 'bot', elementId = null, isLoading = f
   const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   // XSS Himoyasi: Matnni oldindan to'liq escape qilish
-  const safeText = escapeHtml(text);
+  let safeText = escapeHtml(text);
+  if (sender === 'bot') {
+    // Server javobi Telegram HTML formatida keladi: escape dan keyin faqat xavfsiz teglar tiklanadi
+    safeText = safeText
+      .replace(/&lt;(\/?)(b|strong|i|em|u|code|pre|blockquote)(?: expandable(?:=&quot;&quot;)?)?&gt;/g, '<$1$2>')
+      .replace(/&lt;a href=&quot;(https:\/\/(?:[^&\s]|&amp;)+?)&quot;&gt;/g, '<a href="$1" target="_blank" rel="noopener noreferrer">')
+      .replace(/&lt;\/a&gt;/g, '</a>');
+  }
   let formatted = safeText
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
@@ -1020,10 +1031,12 @@ function initQueueDates() {
     const d = new Date(now);
     d.setDate(now.getDate() + offset);
     offset++;
-    if (d.getDay() === 0) continue; // Skip Sunday
+    if (d.getDay() === 0 || d.getDay() === 6) continue; // Qabul faqat Dushanba-Juma
 
+    // toISOString UTC sanani beradi: Toshkentda yarim tundan keyin bir kun orqada qolardi
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     days.push({
-      dateStr: d.toISOString().split('T')[0],
+      dateStr: dateStr,
       dayName: weekDays[d.getDay()],
       dayNum: d.getDate(),
       monthName: monthNames[d.getMonth()]
@@ -1040,24 +1053,65 @@ function initQueueDates() {
   `).join('');
 
   state.selectedDate = days[0].dateStr;
+  loadQueueSlots(days[0].dateStr);
+}
+
+// Tanlangan sana uchun vaqtlarni serverdagi haqiqiy bandlik bilan chizadi
+async function loadQueueSlots(dateStr) {
+  const slotsContainer = document.getElementById('queueSlotsContainer');
+  if (!slotsContainer) return;
+
+  const lang = state.lang || 'uz_cyr';
+  let slots = ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00'];
+  let booked = [];
+  try {
+    const res = await fetch(`/api/queue/slots?date=${encodeURIComponent(dateStr)}`, { headers: getAuthHeaders() });
+    if (res.ok) {
+      const data = await res.json();
+      slots = data.slots || slots;
+      booked = data.booked || [];
+    }
+  } catch (e) {
+    // Tarmoq xatosida ham ro'yxat ko'rinadi: band vaqtni baribir server rad etadi
+  }
+  if (state.selectedDate !== dateStr) return; // Javob kelguncha boshqa sana tanlangan
+
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const nowTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const isUnavailable = (s) => booked.includes(s) || (dateStr === todayStr && s <= nowTime);
+  const firstFree = slots.find(s => !isUnavailable(s)) || null;
 
   const freeLabel = lang === 'ru' ? 'Свободно' : 'Бўш';
-  const slots = ['09:00', '10:00', '11:00', '14:00', '15:00', '16:00', '17:00'];
-  slotsContainer.innerHTML = slots.map((s, i) => `
-    <div class="time-slot ${i === 1 ? 'selected' : ''}" onclick="selectQueueSlot('${s}', this)">
-      <span class="slot-time">${s}</span>
+  const busyLabel = lang === 'ru' ? 'Занято' : 'Банд';
+  const pastLabel = lang === 'ru' ? 'Прошло' : 'Ўтган';
+  slotsContainer.innerHTML = slots.map(s => {
+    const safeSlot = escapeHtml(s);
+    if (isUnavailable(s)) {
+      const label = booked.includes(s) ? busyLabel : pastLabel;
+      return `
+    <div class="time-slot" style="opacity: 0.45; pointer-events: none;">
+      <span class="slot-time">${safeSlot}</span>
+      <span class="slot-status">${label}</span>
+    </div>`;
+    }
+    return `
+    <div class="time-slot ${s === firstFree ? 'selected' : ''}" data-slot="${safeSlot}" onclick="selectQueueSlot(this.getAttribute('data-slot'), this)">
+      <span class="slot-time">${safeSlot}</span>
       <span class="slot-status">${freeLabel}</span>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 
-  state.selectedSlot = slots[1];
+  state.selectedSlot = firstFree;
 }
 
 function selectQueueDate(dateStr, el) {
   haptic('selection');
   state.selectedDate = dateStr;
+  state.selectedSlot = null;
   document.querySelectorAll('.day-chip').forEach(c => c.classList.remove('selected'));
   el.classList.add('selected');
+  loadQueueSlots(dateStr);
 }
 
 function selectQueueSlot(slot, el) {
@@ -1103,6 +1157,7 @@ async function confirmBooking() {
       const errMsg = (data && data.message) ? data.message : "Навбат олишда хатолик юз берди";
       showToast("❌ " + errMsg);
       haptic('error');
+      loadQueueSlots(state.selectedDate); // Boshqa fuqaro band qilgan bo'lishi mumkin
     }
   } catch (e) {
     showToast("❌ Сервер билан алоқада хатолик");
@@ -1110,7 +1165,7 @@ async function confirmBooking() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = (state.lang === 'ru') ? "Записаться на прием" : "Қабулга ёзилиш";
+      btn.textContent = t('queue_btn_confirm', '🎟 Навбатни тасдиқлаш');
     }
   }
 }
@@ -1361,7 +1416,7 @@ async function submitVerification() {
   const address = document.getElementById('vAddress').value.trim();
 
   if (!fio || !phone || !address) {
-    showToast(lang === 'ru' ? 'Пожалуйста, введите имя, телефон и адрес!' : 'Илтимос, исм, телефон ва манзилни тўлиқ киритинг!');
+    showToast(state.lang === 'ru' ? 'Пожалуйста, введите имя, телефон и адрес!' : 'Илтимос, исм, телефон ва манзилни тўлиқ киритинг!');
     return;
   }
 
@@ -1381,19 +1436,24 @@ async function submitVerification() {
       body: JSON.stringify(payload)
     });
 
-    closeModal('verifyModal');
     const data = await res.json();
 
     if (res.ok && data.status === 'ok') {
+      closeModal('verifyModal');
+      if (data.already_verified) {
+        showToast(data.message);
+        return;
+      }
       state.user.is_verified = false;
       state.user.status = 'Kutmoqda';
       state.user.fio = fio;
       state.user.phone = phone;
       state.user.address = address;
       updateVerificationBadge(false, 'Kutmoqda');
-      showToast(lang === 'ru' ? 'Ваши данные отправлены на проверку ⏳' : 'Маълумотларингиз админга юборилди! Тасдиқланиши кутилмоқда ⏳');
+      showToast(state.lang === 'ru' ? 'Ваши данные отправлены на проверку ⏳' : 'Маълумотларингиз админга юборилди! Тасдиқланиши кутилмоқда ⏳');
       haptic('success');
     } else {
+      // Xato bo'lsa oyna ochiq qoladi: fuqaro kiritganini qayta yozmasdan tuzatadi
       showToast("❌ " + (data.message || 'Хатолик юз берди'));
       haptic('error');
     }

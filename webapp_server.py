@@ -12,16 +12,17 @@ Xavfsizlik va funksional takomillashtirishlar:
 6. Server-side Rate Limiting (DoS va AI resurslarini suiiste'mol qilishdan himoya).
 """
 
+import io
 import os
 import re
 import html
-import json
 import time
 import logging
 import threading
 from functools import wraps
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
+from telebot import types
 
 import database
 import local_legal_advisor
@@ -36,23 +37,75 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEBAPP_DIR = os.path.join(BASE_DIR, "webapp")
 
 app = Flask(__name__, static_folder=WEBAPP_DIR, static_url_path="")
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB limit
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # 1 MB limit: API faqat matn qabul qiladi
 
-# Telegram bot instance pointer (main.py tomonidan o'rnatiladi)
+# main.py tomonidan o'rnatiladigan bog'lanishlar
 _bot_instance = None
-ADMIN_ID = os.getenv("ADMIN_ID", "7840350353").strip()
+_ai_backend = None
+_lang_change_listener = None
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
 
 # Rate limiting xotirasi (IP / User ID bo'yicha)
 _rate_limits = {}
 _rate_lock = threading.Lock()
+_RATE_LIMITS_MAX_KEYS = 10000
+_RATE_LIMIT_MAX_WINDOW = 3600
+
+ALLOWED_PRIORITIES = {"ODDIY", "ORTA", "SHOSHILINCH"}
+MAX_CATEGORY_LENGTH = 100
+RATEABLE_STATUSES = {"Hal etildi", "Rad etildi", "Yopildi", "Boshqa tashkilotga yuborildi"} | set(database.AUTO_ANSWER_STATUSES)
+
+_PASSPORT_CYR_TO_LAT = str.maketrans({
+    "А": "A", "В": "B", "С": "C", "Д": "D", "Е": "E", "Ф": "F", "Г": "G", "Ҳ": "H", "И": "I",
+    "Ж": "J", "К": "K", "Л": "L", "М": "M", "Н": "N", "О": "O", "П": "P", "Қ": "Q", "Р": "R",
+    "Т": "T", "У": "U", "Х": "X", "Й": "Y", "З": "Z",
+})
 
 
 def set_bot_instance(bot):
     """main.py dagi bot obyektini serverga ulash."""
     global _bot_instance
     _bot_instance = bot
+
+
+def set_ai_backend(backend):
+    """Mini App suhbati uchun javob funksiyasini ulash: backend(question, user_id, lang) -> dict."""
+    global _ai_backend
+    _ai_backend = backend
+
+
+def set_lang_change_listener(listener):
+    """Til o'zgarganda botning xotirasini yangilash: listener(user_id: int, lang: str)."""
+    global _lang_change_listener
+    _lang_change_listener = listener
+
+
+def _json_body() -> dict:
+    """So'rov tanasini lug'at sifatida qaytaradi; JSON noto'g'ri bo'lsa bo'sh lug'at."""
+    data = request.get_json(force=True, silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _client_ip() -> str:
+    """Mijoz IP manzili. Sarlavhaga faqat mahalliy cloudflared ulanishida ishoniladi, aks holda uni soxtalashtirish mumkin."""
+    remote = request.remote_addr or "unknown"
+    if remote in ("127.0.0.1", "::1"):
+        return request.headers.get("CF-Connecting-IP", remote).strip() or remote
+    return remote
+
+
+def _parse_identity_document(raw: str):
+    """Pasport (AA1234567) yoki 14 xonali JSHSHIR ni ajratadi. Qaytadi: (pasport, jshshir) yoki noto'g'ri bo'lsa None."""
+    cleaned = re.sub(r"[\s\-_]", "", str(raw or "")).upper().translate(_PASSPORT_CYR_TO_LAT)
+    if not cleaned:
+        return "", ""
+    if re.fullmatch(r"[A-Z]{2}\d{7}", cleaned):
+        return cleaned, ""
+    if re.fullmatch(r"\d{14}", cleaned):
+        return "", cleaned
+    return None
 
 
 def get_bot_token() -> str:
@@ -97,6 +150,10 @@ def check_rate_limit(key: str, max_requests: int = 60, window_seconds: int = 60)
             return False
         timestamps.append(now)
         _rate_limits[key] = timestamps
+        if len(_rate_limits) > _RATE_LIMITS_MAX_KEYS:
+            stale = [k for k, v in _rate_limits.items() if not v or now - v[-1] >= _RATE_LIMIT_MAX_WINDOW]
+            for k in stale:
+                del _rate_limits[k]
         return True
 
 
@@ -104,48 +161,34 @@ def check_rate_limit(key: str, max_requests: int = 60, window_seconds: int = 60)
 def apply_rate_limiting():
     """Barcha /api/ so'rovlariga tezlik cheklovini qo'llash."""
     if request.path.startswith("/api/"):
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
-        if not check_rate_limit(f"ip:{client_ip}", max_requests=100, window_seconds=60):
+        if not check_rate_limit(f"ip:{_client_ip()}", max_requests=100, window_seconds=60):
             return jsonify({"status": "error", "message": "Juda ko'p so'rovlar yuborildi. Iltimos, bir oz kuting."}), 429
 
 
 @app.after_request
 def add_security_headers(response):
     """Qat'iy xavfsizlik va keshga qarshi sarlavhalar."""
+    # Mini App o'z domenidan ochiladi va avtorizatsiya sarlavha orqali o'tadi (cookie emas),
+    # shuning uchun boshqa domenlardan faqat Telegram va WEB_APP_URL ga ruxsat beriladi.
     origin = request.headers.get("Origin", "")
-    allowed_patterns = [
-        r"^https://web\.telegram\.org$",
-        r"^https://oauth\.telegram\.org$",
-        r"^https://.*\.telegram\.org$",
-        r"^https://.*\.trycloudflare\.com$",
-    ]
-    if WEB_APP_URL:
-        # WEB_APP_URL dan domenni ruxsat berilganlar ro'yxatiga qo'shish
-        allowed_patterns.append(re.escape(WEB_APP_URL.rstrip("/")))
-
-    is_allowed = False
-    if not origin or origin == "null":
+    if origin == "null":
         # Telegram Webview ichidagi mahalliy sahifalar uchun
-        is_allowed = True
         response.headers["Access-Control-Allow-Origin"] = "*"
-    else:
-        for pat in allowed_patterns:
-            if re.match(pat, origin):
-                is_allowed = True
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-                break
-        if not is_allowed:
-            # Standart xavfsiz ruxsat
-            response.headers["Access-Control-Allow-Origin"] = "https://web.telegram.org"
+    elif origin and (
+        re.fullmatch(r"https://([a-z0-9-]+\.)*telegram\.org", origin)
+        or (WEB_APP_URL and origin == WEB_APP_URL.rstrip("/"))
+    ):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
 
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Telegram-Init-Data,X-Test-User-Id"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Telegram-Init-Data"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "ALLOWALL"
     response.headers["Content-Security-Policy"] = (
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org; "
-        "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://telegram.org https://*.telegram.org https://cdn.jsdelivr.net data: blob:;"
+        "default-src 'self' 'unsafe-inline' https://telegram.org https://*.telegram.org data: blob:; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:;"
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -168,12 +211,8 @@ def extract_and_verify_auth() -> tuple:
     elif init_data_raw.lower().startswith("tma "):
         init_data_raw = init_data_raw[4:].strip()
 
-    # 2. URL parametrlaridan qidirish (fallback)
-    if not init_data_raw:
-        init_data_raw = request.args.get("initData") or ""
-
-    # Pytest / Test rejimi uchun xavfsiz bypass tekshiruvi
-    if app.config.get("TESTING") or os.getenv("TESTING") == "1":
+    # Pytest / Test rejimi uchun bypass: faqat kod ichidan yoqiladi, muhit o'zgaruvchisi bilan yoqilmaydi
+    if app.config.get("TESTING"):
         test_uid = request.headers.get("X-Test-User-Id")
         if test_uid:
             return True, {
@@ -360,7 +399,7 @@ def get_system_settings_api():
 @require_tma_auth
 def set_lang_api():
     """Foydalanuvchi tilini saqlash (faqat autentifikatsiyalangan fuqaroning o'zi uchun)."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     lang = str(data.get("lang", "")).strip()
     telegram_id = request.authenticated_user_id
 
@@ -368,11 +407,8 @@ def set_lang_api():
         return jsonify({"status": "error", "message": "Noto'g'ri til tanlandi"}), 400
 
     database.set_user_lang(telegram_id, lang)
-    try:
-        import main
-        main.user_lang_cache[int(telegram_id)] = lang
-    except Exception:
-        pass
+    if _lang_change_listener:
+        _lang_change_listener(int(telegram_id), lang)
 
     return jsonify({"status": "ok", "lang": lang})
 
@@ -384,7 +420,7 @@ def set_lang_api():
 @require_tma_auth
 def verify_citizen():
     """Shaxsni tasdiqlash so'rovi (ID autentifikatsiyalangan sessiyadan olinadi)."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     telegram_id = request.authenticated_user_id
     fio = str(data.get("fio", "")).strip()
     phone = str(data.get("phone", "")).strip()
@@ -394,9 +430,32 @@ def verify_citizen():
     if not fio or not phone:
         return jsonify({"status": "error", "message": "F.I.Sh. va telefon to'liq kiritilishi kerak"}), 400
 
-    # Pasport va JSHSHIR ajratish
-    pasport = doc if len(doc) <= 10 else ""
-    jshshir = doc if len(doc) == 14 and doc.isdigit() else ""
+    if not 3 <= len(fio) <= 120 or len(address) > 200:
+        return jsonify({"status": "error", "message": "Ф.И.Ш. ёки манзил узунлиги нотўғри"}), 400
+
+    if not re.fullmatch(r"\+?[\d\s()\-]{9,20}", phone) or not 9 <= len(re.sub(r"\D", "", phone)) <= 15:
+        return jsonify({"status": "error", "message": "Телефон рақами нотўғри киритилган"}), 400
+
+    parsed_doc = _parse_identity_document(doc)
+    if parsed_doc is None:
+        return jsonify({"status": "error", "message": "Паспорт (AA1234567) ёки 14 хонали ЖШШИР нотўғри киритилган"}), 400
+    pasport, jshshir = parsed_doc
+
+    # Tasdiqlangan fuqaro o'z maqomini "Kutmoqda" ga qaytarib qo'ymasligi kerak
+    current = database.get_citizen_by_tg_id(telegram_id)
+    if current and current.get("Status") == "Tasdiqlangan":
+        return jsonify({"status": "ok", "already_verified": True, "message": "Шахсингиз аввал тасдиқланган."})
+
+    if not check_rate_limit(f"verify:{telegram_id}", max_requests=5, window_seconds=3600):
+        return jsonify({"status": "error", "message": "Жуда кўп уриниш. Илтимос, кейинроқ қайта уриниб кўринг."}), 429
+
+    is_duplicate, _ = database.find_duplicate_citizen(telegram_id, telefon=phone, pasport=pasport, jshshir=jshshir)
+    if is_duplicate:
+        database.log_audit_event(telegram_id, "CITIZEN_DUPLICATE_ATTEMPT", telegram_id, "Mini App", "FAILED")
+        return jsonify({
+            "status": "error",
+            "message": "Ушбу телефон ёки ҳужжат бошқа фойдаланувчида рўйхатдан ўтган. Ижтимоий ходимга мурожаат қилинг."
+        }), 409
 
     success = database.save_or_update_citizen(
         user_id=telegram_id,
@@ -410,7 +469,6 @@ def verify_citizen():
     )
 
     if success:
-        from telebot import types
         markup = types.InlineKeyboardMarkup(row_width=2)
         markup.add(
             types.InlineKeyboardButton("✅ Тасдиқлаш", callback_data=f"adm_appr_cit_{telegram_id}"),
@@ -444,17 +502,22 @@ def verify_citizen():
 @require_tma_auth
 def submit_appeal():
     """Rasmiy murojaat yuborish (Egalik qat'iy tekshiriladi)."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     telegram_id = request.authenticated_user_id
-    category = str(data.get("category", "Umumiy")).strip()
+    category = str(data.get("category", "Umumiy")).strip()[:MAX_CATEGORY_LENGTH] or "Umumiy"
     text = str(data.get("text", "")).strip()
-    priority = str(data.get("priority", "ODDIY")).strip()
+    priority = str(data.get("priority", "ODDIY")).strip().upper()
+    if priority not in ALLOWED_PRIORITIES:
+        priority = "ODDIY"
 
     if not text:
         return jsonify({"status": "error", "message": "Мурожаат матни бўш бўлиши мумкин эмас"}), 400
 
     if len(text) > 4000:
         return jsonify({"status": "error", "message": "Мурожаат матни жуда узун (максимал 4000 белги)"}), 400
+
+    if not check_rate_limit(f"appeal:{telegram_id}", max_requests=10, window_seconds=3600):
+        return jsonify({"status": "error", "message": "Жуда кўп мурожаат юборилди. Илтимос, кейинроқ уриниб кўринг."}), 429
 
     # 1. Dastlabki tahlil (Mahalliy 0-token tekshiruvi)
     handled_locally, turi, muhimlik, ai_javob = local_legal_advisor.try_local_answer(text, telegram_id)
@@ -468,11 +531,10 @@ def submit_appeal():
     murojaat_id = database.save_murojaat(
         user_id=telegram_id,
         savol=text,
-        ai_javobi=ai_javob,
+        ai_javobi=re.sub(r"<[^>]+>", "", ai_javob),
         turi=category,
         muhimlik=priority,
         status="Yangi",
-        admin_izohi="Mini App orqali yuborildi"
     )
 
     # 3. Adminga xabarnoma chiqarish
@@ -485,8 +547,8 @@ def submit_appeal():
     )
 
     safe_text = html.escape(text)
-    safe_fio = html.escape(citizen.get('FIO', request.tma_user.get('first_name', 'Фуқаро')))
-    safe_phone = html.escape(citizen.get('Telefon', 'Кўрсатилмаган'))
+    safe_fio = html.escape(citizen.get('FIO') or request.tma_user.get('first_name') or 'Фуқаро')
+    safe_phone = html.escape(citizen.get('Telefon') or 'Кўрсатилмаган')
     safe_cat = html.escape(category)
 
     if not is_verified:
@@ -542,11 +604,21 @@ def submit_appeal():
 # ==============================================================================
 # 5. ELEKTRON NAVBAT (BOOKING, BEKOR QILISH VA SLOT BO'SHATISH)
 # ==============================================================================
+@app.route("/api/queue/slots", methods=["GET"])
+@require_tma_auth
+def get_queue_slots():
+    """Berilgan sanadagi band vaqtlar (fuqaro ma'lumotisiz)."""
+    date_str = str(request.args.get("date", "")).strip()
+    if not database.parse_appointment_date(date_str):
+        return jsonify({"status": "error", "message": "Сана нотўғри кўрсатилган"}), 400
+    return jsonify({"status": "ok", "slots": database.QUEUE_SLOTS, "booked": database.get_booked_slots(date_str)})
+
+
 @app.route("/api/queue", methods=["POST"])
 @require_tma_auth
 def submit_queue():
     """Elektron navbat band qilish (Poyga holati va takrorlanishdan to'liq himoyalangan)."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     telegram_id = request.authenticated_user_id
     date_str = str(data.get("date", "")).strip()
     time_slot = str(data.get("time_slot", "")).strip()
@@ -583,6 +655,9 @@ def submit_queue():
     # QR kod ma'lumotlari uchun unikal token olish
     ticket_data = database.get_citizen_active_navbat(telegram_id) or {}
     token = ticket_data.get("token", "")
+    # Bazadagi tekshirilgan yagona format ko'rsatiladi
+    date_str = ticket_data.get("Qabul_Kuni") or date_str
+    time_slot = ticket_data.get("Qabul_Soati") or time_slot
 
     safe_fio = html.escape(fio)
     alert_text = (
@@ -612,9 +687,9 @@ def submit_queue():
 @require_tma_auth
 def cancel_queue():
     """Fuqaro yoki admin tomonidan navbatni bekor qilish va slotni bo'shatish."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     ticket_number = str(data.get("ticket_number", "")).strip()
-    reason = str(data.get("reason", "Fuqaro tomonidan bekor qilindi")).strip()
+    reason = str(data.get("reason", "Fuqaro tomonidan bekor qilindi")).strip()[:300]
     user_id = request.authenticated_user_id
     is_admin = bool(request.tma_user.get("is_admin"))
 
@@ -651,13 +726,19 @@ def verify_queue_qr():
 @require_tma_auth
 def submit_rate():
     """CSAT baholash (Faqat o'z arizasini baholay oladi)."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     appeal_id = str(data.get("appeal_id", "")).strip()
-    score = int(data.get("score", 5))
     telegram_id = request.authenticated_user_id
 
     if not appeal_id:
         return jsonify({"status": "error", "message": "appeal_id talab qilinadi"}), 400
+
+    try:
+        score = int(data.get("score"))
+    except (TypeError, ValueError):
+        score = 0
+    if not 1 <= score <= 5:
+        return jsonify({"status": "error", "message": "Баҳо 1 дан 5 гача бўлиши керак"}), 400
 
     # Egalik huquqi tekshiruvi: ushbu murojaat haqiqatan shu fuqaronikimi?
     murojaat = database.get_murojaat_by_id(appeal_id)
@@ -667,6 +748,12 @@ def submit_rate():
     if not request.tma_user.get("is_admin") and str(murojaat.get("Telegram_ID")) != str(telegram_id):
         database.log_audit_event(telegram_id, "UNAUTHORIZED_RATE_ATTEMPT", appeal_id, "Boshqa fuqaro murojaatini baholashga urinish", "FAILED")
         return jsonify({"status": "error", "message": "Сиз фақат ўзингизнинг мурожаатингизни баҳолай оласиз"}), 403
+
+    if murojaat.get("Status") not in RATEABLE_STATUSES:
+        return jsonify({"status": "error", "message": "Мурожаат кўриб чиқилгандан кейин баҳолаш мумкин"}), 400
+
+    if murojaat.get("Baho") not in (None, ""):
+        return jsonify({"status": "error", "message": "Ушбу мурожаат аввал баҳоланган"}), 409
 
     database.save_murojaat_rating(appeal_id, score, actor=telegram_id)
     stars = "⭐" * score
@@ -687,7 +774,7 @@ def submit_rate():
 @require_tma_auth
 def ai_chat():
     """AI Huquqiy maslahatchi chat API si."""
-    data = request.get_json(force=True) or {}
+    data = _json_body()
     message = str(data.get("message", "")).strip()
     user_id = request.authenticated_user_id
 
@@ -697,33 +784,24 @@ def ai_chat():
     if len(message) > 3000:
         return jsonify({"status": "error", "message": "Савол матни жуда узун"}), 400
 
-    # 1. 0-token Mahalliy bazaviy qidiruv
-    try:
-        handled_locally, _, _, local_ans = local_legal_advisor.try_local_answer(message, user_id)
-        if handled_locally and local_ans:
-            return jsonify({
-                "status": "ok",
-                "source": "local_database_0_tokens",
-                "reply": to_new_uzbek_latin(local_ans)
-            })
-    except Exception as e:
-        logger.error(f"Mahalliy javob xatosi: {e}")
+    # AI kvotasini bitta foydalanuvchi tugatib qo'ymasligi uchun
+    if not check_rate_limit(f"ai_chat:{user_id}", max_requests=10, window_seconds=60):
+        return jsonify({"status": "error", "message": "Жуда кўп савол юборилди. Илтимос, бир дақиқадан сўнг қайта уриниб кўринг."}), 429
 
-    # 2. Gemini/Groq zaxira tizimi
+    # 1. Bot bilan bir xil javob oqimi (mahalliy baza, keyin hujjatga tayangan AI)
     try:
-        import main
-        if hasattr(main, "call_gemini_safe"):
-            resp = main.call_gemini_safe(message)
-            reply_text = getattr(resp, "text", str(resp))
-            return jsonify({
-                "status": "ok",
-                "source": "gemini_groq_failover",
-                "reply": to_new_uzbek_latin(reply_text)
-            })
+        if _ai_backend:
+            result = _ai_backend(message, user_id, database.get_user_lang(user_id))
+            if result.get("answer"):
+                return jsonify({"status": "ok", "source": result.get("source", "ai"), "reply": result["answer"]})
+        else:
+            handled_locally, _, _, local_ans = local_legal_advisor.try_local_answer(message, user_id)
+            if handled_locally and local_ans:
+                return jsonify({"status": "ok", "source": "local", "reply": to_new_uzbek_latin(local_ans)})
     except Exception as ai_err:
         logger.warning(f"AI chaqirishda xatolik: {ai_err}")
 
-    # 3. Zaxira shoshilinch javob
+    # 2. Zaxira shoshilinch javob
     fallback_reply = (
         "Ҳурматли фуқаро! Саволингиз Шайх-Али МФЙ ҳуқуқий базаси бўйича қабул қилинди. "
         "Ушбу масала юзасидан бепул ва тўлиқ қонуний маслаҳат олиш учун Шайх-Али МФЙ ижтимоий ходими "
@@ -743,18 +821,28 @@ def ai_chat():
 @require_admin
 def admin_audit_logs():
     """Faqat administrator uchun: tizim audit jurnali."""
-    limit = int(request.args.get("limit", 50))
-    logs = database.get_audit_logs(limit=min(limit, 200))
+    limit = request.args.get("limit", 50, type=int)
+    logs = database.get_audit_logs(limit=max(1, min(limit, 200)))
     return jsonify({"status": "ok", "audit_logs": logs})
 
 
 @app.route("/api/admin/export_excel", methods=["POST"])
 @require_admin
 def admin_export_excel():
-    """Faqat administrator uchun: Excel eksporti."""
+    """Faqat administrator uchun: Excel eksporti (fayl yuboriladi, serverda nusxa qoldirilmaydi)."""
     try:
         path = database.export_all_to_excel(actor=request.authenticated_user_id)
-        return jsonify({"status": "ok", "file_path": path, "filename": os.path.basename(path)})
+        try:
+            with open(path, "rb") as f:
+                content = io.BytesIO(f.read())
+        finally:
+            os.remove(path)
+        return send_file(
+            content,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=os.path.basename(path),
+        )
     except Exception as e:
         logger.error(f"Eksport xatosi: {e}")
         return jsonify({"status": "error", "message": "Eksportda xatolik"}), 500
@@ -763,13 +851,13 @@ def admin_export_excel():
 # ==============================================================================
 # 9. SERVERNI ISHGA TUSHIRISH
 # ==============================================================================
-def run_server(host="0.0.0.0", port=5001):
+def run_server(host="127.0.0.1", port=5001):
     """Flask serverini ishga tushirish."""
     logger.info(f"🌐 TMA WebApp Server faollashmoqda: http://{host}:{port}")
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
-def start_server_in_background(host="0.0.0.0", port=5001, bot=None):
+def start_server_in_background(host="127.0.0.1", port=5001, bot=None):
     """Serverni alohida orqa fonda (daemon thread) ishga tushiradi."""
     if bot:
         set_bot_instance(bot)
@@ -780,4 +868,4 @@ def start_server_in_background(host="0.0.0.0", port=5001, bot=None):
 
 if __name__ == "__main__":
     database.init_database()
-    run_server(host="0.0.0.0", port=5001)
+    run_server(host=os.getenv("WEBAPP_HOST", "127.0.0.1"), port=int(os.getenv("PORT", 5001)))

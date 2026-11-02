@@ -94,6 +94,11 @@ GEMINI_MODEL_NAME=gemini-2.5-flash
 GROQ_API_KEY=YOUR_GROQ_API_KEY_HERE
 ```
 
+Ixtiyoriy parametrlar:
+* `WEBAPP_HOST` — Mini App serveri manzili. Standart `127.0.0.1` (cloudflared shu manzilga ulanadi). Tashqi tarmoqqa to'g'ridan-to'g'ri ochish kerak bo'lsagina `0.0.0.0` bering.
+* `IHMA_DATA_DIR` — baza, zaxira va dalolatnomalar saqlanadigan papka. Standart: loyiha papkasi.
+* `ADMIN_TELEGRAPH_PUBLISH=1` — admin keys tahlilini ommaviy Telegraph sahifasida nashr qilish. Standart o'chiq, chunki sahifani havolasi bor har kim o'qiy oladi va niqoblash ism yoki manzilni yashirmaydi.
+
 ### 5-qadam: Botni ishga tushirish
 * **Windows uchun:**
   ```cmd
@@ -120,7 +125,7 @@ Bot ishga tushganda terminalda quyidagi yozuv chiqadi:
 
 ## 📱 Telegram Mini App (TMA) ni sozlash va ishga tushirish
 
-Bot ishga tushganda uning ichki Flask veb-serveri avtomatik ravishda `http://0.0.0.0:5001` portida ishlay boshlaydi.
+Bot ishga tushganda uning ichki Flask veb-serveri avtomatik ravishda `http://127.0.0.1:5001` manzilida ishlay boshlaydi.
 
 Telegram mobil va desktop ilovasi xavfsizlik talablariga ko'ra Mini App lardan faqat **HTTPS** protokoli orqali ochilishini talab qiladi.
 
@@ -149,7 +154,7 @@ Hosil bo'lgan `https://...ngrok-free.app` manzilini `.env` faylida `WEB_APP_URL`
 ## 🗄️ Ma'lumotlar bazasini zaxiralash va tiklash (Backup & Restore)
 
 ### Zaxira nusxa (Backup) olish:
-Loyiha ichidagi `database.py` moduli har qanday nozik amal va o'zgarishlardan oldin avtomatik ravishda `backups/` jildiga vaqt tamg'ali nusxa yaratadi.
+Bot ishlab turganda kuniga bir marta `backups/` jildiga vaqt tamg'ali nusxa oladi va eng yangi 30 tasini saqlab, eskilarini o'chiradi. Zaxiralar shu kompyuterda turadi: disk ishdan chiqsa ular ham yo'qoladi, shuning uchun vaqti-vaqti bilan `/backup` buyrug'i orqali tashqariga ham oling.
 Qo'lda tezkor zaxira olish:
 ```bash
 python3 -c "import database; print('Zaxira yaratildi:', database.backup_database())"
@@ -165,10 +170,10 @@ python3 -c "import database; database.restore_database('backups/ihma_database_ba
 
 ## 🧪 Avtomatlashtirilgan testlarni ishga tushirish
 
-Loyihada 18 ta asosiy xavfsizlik, ma'lumotlar yaxlitligi va funksional sinovlarni o'z ichiga olgan Pytest test to'plami mavjud:
+Loyihada xavfsizlik, ma'lumotlar yaxlitligi va funksional sinovlarni o'z ichiga olgan Pytest test to'plami mavjud:
 ```bash
-python3 -m pytest tests/test_master_suite.py -v
+python3 -m pytest tests
 ```
-Barcha testlar ishlab chiqarish bazasiga tegmasdan, vaqtinchalik xavfsiz test muhitida (`tempfile`) izolyatsiyalangan holda bajariladi.
+`tests/conftest.py` testlarni vaqtinchalik papkaga yo'naltiradi: haqiqiy baza, token va `.env` kerak emas. Telegram, Gemini va Groq bilan haqiqiy aloqa testlarda tekshirilmaydi.
 
 

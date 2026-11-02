@@ -8,6 +8,7 @@ moddalarga bo'lish, qonuniy tahlil qilish va qat'iy Grounding asosida javob beri
 import os
 import re
 import json
+import threading
 import zipfile
 import subprocess
 import xml.etree.ElementTree as ET
@@ -44,7 +45,7 @@ LAT_TO_CYR_MAP = {
 CYR_TO_LAT_MAP = {
     "ў": "o'", "ғ": "g'", "ш": "sh", "ч": "ch", "ё": "yo", "ю": "yu", "я": "ya",
     "а": "a", "б": "b", "д": "d", "э": "e", "ф": "f", "г": "g", "ҳ": "h",
-    "и": "i", "ж": "j", "k": "к", "l": "l", "м": "m", "n": "n", "o": "o",
+    "и": "i", "ж": "j", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
     "п": "p", "қ": "q", "р": "r", "с": "s", "т": "t", "у": "u", "в": "v",
     "х": "x", "й": "y", "з": "z", "е": "e", "ц": "ts", "щ": "sh", "ъ": "'",
 }
@@ -386,19 +387,33 @@ def build_knowledge_index() -> dict:
     }
 
     try:
-        with open(INDEX_FILE, "w", encoding="utf-8") as f:
+        # Yozish vaqtida parallel o'qish yarim fayl ko'rmasligi uchun avval vaqtinchalik faylga yoziladi
+        tmp_file = f"{INDEX_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(index_data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, INDEX_FILE)
     except Exception as e:
         print(f"⚠️ Indeksni saqlashda xatolik: {e}")
 
     return index_data
 
 
+_index_cache = {"signature": None, "data": None}
+_index_cache_lock = threading.Lock()
+
+
 def load_knowledge_index() -> dict:
+    # Indeks katta (17 MB): fayl o'zgarmaguncha xotiradagi nusxadan foydalaniladi
     if os.path.exists(INDEX_FILE):
         try:
-            with open(INDEX_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            stat = os.stat(INDEX_FILE)
+            signature = (stat.st_mtime_ns, stat.st_size)
+            with _index_cache_lock:
+                if _index_cache["signature"] != signature:
+                    with open(INDEX_FILE, "r", encoding="utf-8") as f:
+                        _index_cache["data"] = json.load(f)
+                    _index_cache["signature"] = signature
+                return _index_cache["data"]
         except Exception:
             pass
     return build_knowledge_index()
@@ -473,8 +488,8 @@ def format_legal_grounding_prompt(query: str, top_chunks: list) -> str:
         f"{context_str}\n\n"
         "### 💡 JAVOB BERISH STANDARTLARI (ANIQLIK VA KENGAYTIRILGAN BILIMLAR):\n"
         "1. Agar yuqorida keltirilgan mahalliy hujjatlar bo'laklarida savolga oid aniq faktlar bo'lsa, ulardan to'liq va asosli foydalaning.\n"
-        "2. Agar savol (masalan: «IHMA qachon tuzilgan?», «Qonun qachon chiqqan?», «Nafaqa qanday hisoblanadi?») bo'yicha yuqoridagi mahalla hujjatlari bo'laklarida to'liq javob bo'lmasa, o'zingizning O'zbekiston Respublikasi qonunchiligi (Prezident Farmon va Qarorlari, xususan 2023-yil 1-iyundagi PF-82-son Farmon, Vazirlar Mahkamasi qarorlari, lex.uz) bo'yicha umumiy va chuqur bilimlaringizdan foydalanib ANIQ, TO'LIQ VA FAKTLAR ASOSIDA javob bering.\n"
-        "3. QAT'IYAN TAQIQLANADI: «Mahalla bazasida bu hujjat keltirilmagan» yoki «Hujjatlarda to'liq ko'rsatma mavjud emas» deb javob qaytarmang! Savolga to'g'ridan-to'g'ri faktlar bilan, lo'nda va tushunarli tarzda javob bering.\n"
+        "2. Agar savol bo'yicha yuqoridagi hujjat bo'laklarida to'liq javob bo'lmasa, O'zbekiston qonunchiligi (Prezident Farmon va Qarorlari, Vazirlar Mahkamasi qarorlari, lex.uz) bo'yicha umumiy bilimlaringizdan foydalanishingiz mumkin, lekin bu ma'lumot mahalla hujjatlari bilan tasdiqlanmaganini ochiq ayting va uni lex.uz yoki ijtimoiy xodim (+998 91 454 53 51) orqali aniqlashtirishni tavsiya qiling.\n"
+        "3. QAT'IYAN TAQIQLANADI: hujjatda ko'rsatilmagan va aniq bilmaydigan qaror raqami, modda, summa, muddat yoki sanani taxmin qilish yoki o'ylab topish. Aniq bilmasangiz, shuni ochiq ayting. Bu fuqaroning huquqiga ta'sir qiladi.\n"
         "4. Javobingiz do'stona, samimiy, oddiy xalq tilida va asosiy mohiyatni punktlar (•) bilan ajratgan holda yozilsin.\n"
         "5. QAT'IY MOLIYAVIY VA HUQUQIY QOIDA: Qonun va qarorlar bo'yicha to'lov, nafaqa va yordam miqdorlari haqida gapirganda TAXMINIY SO'M SUMMALARINI (masalan: «taxminan 500 000 so'm», «750 000 so'm atrofida») ASLO YOZMANG! Barcha miqdorlarni FAQAT qonunda belgilangan BXM (Bazaviy hisoblash miqdori) yoki MIH (Minimal iste'mol xarajatlari) ko'rsatkichlarida (masalan: «BXMning 50 foizi miqdorida», «BXMning 2 baravari miqdorida», «MIH chegarasi bo'yicha») ko'rsating!"
     )

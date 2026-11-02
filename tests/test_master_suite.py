@@ -38,6 +38,7 @@ WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if WORKSPACE_DIR not in sys.path:
     sys.path.insert(0, WORKSPACE_DIR)
 
+from conftest import future_weekday
 import database
 import webapp_server
 from utils.tma_auth import create_test_init_data, verify_telegram_init_data
@@ -257,7 +258,7 @@ def test_8_duplicate_appointments_prevented(test_env):
         fio="Ali Valiyev",
         telefon="+998901112233",
         kocha="1-uy",
-        qabul_kuni="2026-11-20",
+        qabul_kuni=future_weekday(0),
         qabul_soati="10:00 - 10:30",
         db_path=test_db
     )
@@ -270,7 +271,7 @@ def test_8_duplicate_appointments_prevented(test_env):
             fio="Ali Valiyev",
             telefon="+998901112233",
             kocha="1-uy",
-            qabul_kuni="2026-11-21",
+            qabul_kuni=future_weekday(1),
             qabul_soati="11:00 - 11:30",
             db_path=test_db
         )
@@ -282,7 +283,7 @@ def test_8_duplicate_appointments_prevented(test_env):
 # ==============================================================================
 def test_9_concurrent_appointment_booking_safe(test_env):
     test_db = test_env["test_db"]
-    slot_date = "2026-11-22"
+    slot_date = future_weekday(2)
     slot_time = "14:00 - 14:30"
     
     # Citizen B books the slot
@@ -336,7 +337,7 @@ def test_10_past_appointment_dates_rejected(test_env):
 # ==============================================================================
 def test_11_cancelled_appointment_slots_become_available(test_env):
     test_db = test_env["test_db"]
-    slot_date = "2026-11-23"
+    slot_date = future_weekday(3)
     slot_time = "15:00 - 15:30"
     
     # Citizen 5005 books

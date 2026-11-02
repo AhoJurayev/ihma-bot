@@ -105,15 +105,22 @@ def test_admin_reply_command():
             self.id = uid
 
     class MockMessage:
-        def __init__(self, text="/javob M-1027"):
+        def __init__(self, text):
             self.from_user = MockUser(7840350353)
             self.chat = MockUser(7840350353)
             self.text = text
+            self.message_id = 1
+
+    murojaat_id = main.database.save_murojaat(
+        user_id="555001", savol="Javob buyrug'i sinovi", ai_javobi="", turi="SHAXSIY_MUROJAAT",
+        muhimlik="ODDIY", status="Yangi",
+    )
 
     with patch.object(main.bot, "send_message") as mock_send, \
+         patch.object(main.bot, "reply_to"), \
          patch.object(main.bot, "register_next_step_handler") as mock_reg:
-        msg = MockMessage("/javob M-1027")
+        msg = MockMessage(f"/javob {murojaat_id}")
         main.handle_reply_command(msg)
         assert mock_send.called
         assert mock_reg.called
-        assert main.admin_state.get(7840350353, {}).get("reply_murojaat_id") == "M-1027"
+        assert main.admin_state.get(7840350353, {}).get("reply_murojaat_id") == murojaat_id

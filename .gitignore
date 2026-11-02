@@ -7,11 +7,15 @@
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
 ihma_database.db
 fuqarolar.xlsx
 murojaatlar.xlsx
 navbatlar.xlsx
+Shayxali_MFY_Tizim_Hisoboti_*.xlsx
 backups/
+exports/
 dalolatnomalar/
 
 # Logs and runtime artifacts
