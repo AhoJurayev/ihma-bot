@@ -1258,6 +1258,7 @@ function renderActiveTicket() {
       </div>
     </div>
     <div class="ticket-footer">
+      <div id="ticketQrBox" style="text-align: center; margin-bottom: 12px;"></div>
       <p>${noteText}</p>
       <div style="margin-top: 12px; text-align: center;">
         <button class="btn-cancel-ticket" onclick="cancelActiveTicket('${safeNum}')" style="background: rgba(239,68,68,0.1); border: 1px solid #ef4444; color: #ef4444; border-radius: 8px; padding: 6px 14px; font-size: 12px; cursor: pointer; font-weight: 500;">
@@ -1268,6 +1269,26 @@ function renderActiveTicket() {
   `;
   card.style.display = 'block';
   card.scrollIntoView({ behavior: 'smooth' });
+  loadTicketQr();
+}
+
+// QR rasmi avtorizatsiya sarlavhasi bilan olinadi, shuning uchun <img src> ga to'g'ridan-to'g'ri berilmaydi
+async function loadTicketQr() {
+  const box = document.getElementById('ticketQrBox');
+  if (!box) return;
+  try {
+    const res = await fetch('/api/queue/qr', { headers: getAuthHeaders() });
+    if (!res.ok) return;
+    const url = URL.createObjectURL(await res.blob());
+    const img = document.createElement('img');
+    img.alt = 'QR';
+    img.style.cssText = 'width: 160px; height: 160px; background: #fff; padding: 8px; border-radius: 12px;';
+    img.onload = () => URL.revokeObjectURL(url);
+    img.src = url;
+    box.replaceChildren(img);
+  } catch (e) {
+    // QR bo'lmasa ham talon raqami bilan qabulga kirish mumkin
+  }
 }
 
 // --- RASMIY MUROJAAT (APPEALS) LOGIKASI ---

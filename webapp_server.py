@@ -21,8 +21,12 @@ import logging
 import threading
 from functools import wraps
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, send_file
+from urllib.parse import quote
+from flask import Flask, Response, request, jsonify, send_from_directory, send_file
+import qrcode
+from qrcode.image.svg import SvgPathImage
 from telebot import types
+from waitress import serve
 
 import database
 import local_legal_advisor
@@ -715,8 +719,49 @@ def verify_queue_qr():
     if not token:
         return jsonify({"status": "error", "message": "Token kiritilmadi"}), 400
 
-    result = database.verify_appointment_qr_token(token)
+    result = database.verify_appointment_qr_token(str(token))
+    # Telefon kamerasi QR ni brauzerda ochadi: xodim JSON emas, o'qiladigan sahifa ko'radi
+    if request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
+        return _render_qr_verification_page(result)
     return jsonify({"status": "ok", "verification": result})
+
+
+def _render_qr_verification_page(result: dict):
+    """Talon tekshiruvi natijasi (fuqaroning shaxsiy ma'lumotisiz)."""
+    if result.get("valid") and result.get("is_active"):
+        title, color = "✅ Талон ҳақиқий ва фаол", "#16a34a"
+    elif result.get("valid"):
+        title, color = "⚠️ Талон фаол эмас", "#d97706"
+    else:
+        title, color = "❌ Талон топилмади", "#dc2626"
+    rows = "".join(
+        f"<p><b>{label}:</b> {html.escape(str(result.get(key) or ''))}</p>"
+        for label, key in [("Рақами", "ticket_number"), ("Сана", "date"), ("Вақт", "time_slot"), ("Ҳолати", "status")]
+        if result.get(key)
+    )
+    page = (
+        '<!doctype html><html lang="uz"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Навбат талони</title></head>'
+        '<body style="font-family: system-ui, sans-serif; padding: 24px; font-size: 18px;">'
+        f'<h2 style="color: {color};">{title}</h2>{rows}</body></html>'
+    )
+    return Response(page, mimetype="text/html")
+
+
+@app.route("/api/queue/qr", methods=["GET"])
+@require_tma_auth
+def get_queue_qr():
+    """Fuqaroning faol taloni uchun QR kod (SVG). Ichida faqat taxmin qilib bo'lmaydigan token bor."""
+    ticket = database.get_citizen_active_navbat(request.authenticated_user_id)
+    if not ticket or not ticket.get("token"):
+        return jsonify({"status": "error", "message": "Фаол навбат топилмади"}), 404
+
+    # Tunnel manzili o'zgarib turadi, shuning uchun QR so'rov kelgan manzildan yasaladi
+    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+    verify_url = f"{scheme}://{request.host}/api/queue/verify_qr?token={quote(ticket['token'])}"
+    buffer = io.BytesIO()
+    qrcode.make(verify_url, image_factory=SvgPathImage, border=2).save(buffer)
+    return Response(buffer.getvalue(), mimetype="image/svg+xml")
 
 
 # ==============================================================================
@@ -854,7 +899,7 @@ def admin_export_excel():
 def run_server(host="127.0.0.1", port=5001):
     """Flask serverini ishga tushirish."""
     logger.info(f"🌐 TMA WebApp Server faollashmoqda: http://{host}:{port}")
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    serve(app, host=host, port=port, threads=8)
 
 
 def start_server_in_background(host="127.0.0.1", port=5001, bot=None):

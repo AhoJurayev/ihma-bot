@@ -259,6 +259,84 @@ def test_russian_question_reaches_ai_untransliterated():
     assert "Какие документы нужны" in captured["prompt"]
 
 
+def _doc_message(uid=ADMIN_UID, file_name="qaror.pdf"):
+    return SimpleNamespace(
+        content_type="document",
+        text=None,
+        caption=None,
+        document=SimpleNamespace(file_id="file-1", file_name=file_name),
+        from_user=SimpleNamespace(id=uid),
+        chat=SimpleNamespace(id=uid),
+        message_id=1,
+    )
+
+
+def test_unexpected_admin_document_needs_confirmation():
+    main.admin_state.pop(ADMIN_UID, None)
+    with patch.object(main.bot, "reply_to") as reply, patch.object(main, "_ingest_legal_document") as ingest:
+        main.handle_admin_document_upload(_doc_message())
+    assert not ingest.called
+    assert reply.call_args.kwargs["reply_markup"] is not None
+
+    with patch.object(main.bot, "answer_callback_query"), patch.object(main.bot, "edit_message_text"), \
+            patch.object(main, "_ingest_legal_document") as ingest:
+        main.handle_kb_document_confirmation(_callback("kbdoc_no"))
+        assert not ingest.called
+        # Bekor qilingan hujjatni keyin tasdiqlab bo'lmaydi
+        main.handle_kb_document_confirmation(_callback("kbdoc_yes"))
+        assert not ingest.called
+
+
+def test_confirmed_or_requested_admin_document_is_ingested():
+    main.admin_state.pop(ADMIN_UID, None)
+    with patch.object(main.bot, "reply_to"), patch.object(main, "_ingest_legal_document"):
+        main.handle_admin_document_upload(_doc_message())
+    with patch.object(main.bot, "answer_callback_query"), patch.object(main.bot, "edit_message_text"), \
+            patch.object(main, "_ingest_legal_document") as ingest:
+        main.handle_kb_document_confirmation(_callback("kbdoc_yes"))
+    assert ingest.call_args[0][3:] == ("file-1", "qaror.pdf")
+
+    main.admin_state[ADMIN_UID] = {"waiting_for": "legal_document"}
+    with patch.object(main.bot, "reply_to", return_value=SimpleNamespace(message_id=9)), \
+            patch.object(main, "_ingest_legal_document") as ingest:
+        main.handle_admin_document_upload(_doc_message())
+    assert ingest.called
+    main.admin_state.pop(ADMIN_UID, None)
+
+
+def test_other_citizen_cannot_confirm_document():
+    main.admin_state[ADMIN_UID] = {"pending_kb_doc": {"file_id": "f", "file_name": "n"}}
+    with patch.object(main.bot, "answer_callback_query"), patch.object(main, "_ingest_legal_document") as ingest:
+        main.handle_kb_document_confirmation(_callback("kbdoc_yes", uid=999))
+    assert not ingest.called
+    main.admin_state.pop(ADMIN_UID, None)
+
+
+def test_admin_reply_keeps_appeal_open_and_escapes_text():
+    uid = int(_unique_uid()[-9:])
+    m_id = database.save_murojaat(uid, "Javob kutilmoqda", "", "SHAXSIY_MUROJAAT", "ODDIY", "Yangi")
+    main.admin_state[ADMIN_UID] = {"reply_murojaat_id": m_id}
+    msg = SimpleNamespace(text="Pasport nusxasi kerak <b>", from_user=SimpleNamespace(id=ADMIN_UID), chat=SimpleNamespace(id=ADMIN_UID))
+    with patch.object(main, "send_split_message") as split, patch.object(main.bot, "send_message") as send:
+        main.process_admin_direct_reply(msg)
+    row = database.get_murojaat_by_id(m_id)
+    assert row["Status"] == "O'rganilmoqda"
+    assert row["Admin_Izohi"] == "Pasport nusxasi kerak <b>"
+    assert "&lt;b&gt;" in split.call_args.kwargs["text"]
+    assert send.call_args.kwargs["reply_markup"] is not None
+    assert m_id in [a["Murojaat_ID"] for a in database.get_pending_appeals(limit=1000)]
+
+
+def test_admin_reply_does_not_reopen_closed_appeal():
+    uid = int(_unique_uid()[-9:])
+    m_id = database.save_murojaat(uid, "Yopilgan savol", "", "SHAXSIY_MUROJAAT", "ODDIY", "Rad etildi")
+    main.admin_state[ADMIN_UID] = {"reply_murojaat_id": m_id}
+    msg = SimpleNamespace(text="Qo'shimcha izoh", from_user=SimpleNamespace(id=ADMIN_UID), chat=SimpleNamespace(id=ADMIN_UID))
+    with patch.object(main, "send_split_message"), patch.object(main.bot, "send_message"):
+        main.process_admin_direct_reply(msg)
+    assert database.get_murojaat_by_id(m_id)["Status"] == "Rad etildi"
+
+
 def test_everyday_words_are_not_flagged_as_violence():
     import local_legal_advisor
     handled, _, muhimlik, _ = local_legal_advisor.try_local_answer("Ro'yxatda turish uchun nima kerak", 1)
@@ -388,6 +466,27 @@ def test_queue_slots_endpoint_reports_booked_without_pii(client):
     assert "11:00" in body["booked"] and "17:00" not in body["slots"]
     assert "Maxfiy" not in json.dumps(body)
     assert client.get("/api/queue/slots?date=nope", headers=_h(1)).status_code == 400
+
+
+def test_ticket_qr_encodes_token_and_verify_page_has_no_pii(client):
+    uid = _unique_uid()
+    assert client.get("/api/queue/qr", headers=_h(uid)).status_code == 404
+
+    database.save_navbat(uid, "Maxfiy Ism", "+998931110000", "Maxfiy manzil", future_weekday(8), "15:00")
+    res = client.get("/api/queue/qr", headers=_h(uid))
+    assert res.status_code == 200 and res.mimetype == "image/svg+xml"
+    assert b"<svg" in res.data
+    assert client.get("/api/queue/qr").status_code == 401
+
+    token = database.get_citizen_active_navbat(uid)["token"]
+    page = client.get(f"/api/queue/verify_qr?token={token}", headers={"Accept": "text/html"})
+    text = page.get_data(as_text=True)
+    assert page.mimetype == "text/html" and "фаол" in text and "15:00" in text
+    assert "Maxfiy" not in text and "+998" not in text
+
+    bad = client.get("/api/queue/verify_qr?token=<script>", headers={"Accept": "text/html"}).get_data(as_text=True)
+    assert "топилмади" in bad and "<script>" not in bad
+    assert client.get(f"/api/queue/verify_qr?token={token}").get_json()["verification"]["is_active"] is True
 
 
 def test_ai_chat_uses_injected_backend_and_has_per_user_limit(client):

@@ -1760,14 +1760,60 @@ def handle_admin_document_upload(message):
         )
         return
 
+    # Bilimlar bazasi fuqarolarga beriladigan javoblarda ishlatiladi: fuqaro hujjati adashib kirib ketmasligi uchun
+    # "Hujjat yuklash" tugmasisiz yuborilgan fayl faqat tasdiqdan keyin qabul qilinadi
+    if admin_state.get(user_id, {}).get("waiting_for") != "legal_document":
+        admin_state[user_id] = {"pending_kb_doc": {"file_id": doc.file_id, "file_name": fname}}
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("✅ Базага қўшиш", callback_data="kbdoc_yes"),
+            types.InlineKeyboardButton("❌ Бекор қилиш", callback_data="kbdoc_no"),
+        )
+        bot.reply_to(
+            message,
+            f"📄 <b>«{esc(fname)}»</b> ҳужжатини ҳуқуқий билимлар базасига қўшайми?\n\n"
+            "⚠️ <i>База матни фуқароларга бериладиган AI жавобларида ишлатилади. "
+            "Шахсий маълумотли ҳужжатни қўшманг.</i>",
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        return
+
     wait_m = bot.reply_to(
         message,
         f"⏳ <b>«{esc(fname)}»</b> qabul qilinmoqda va chuqur huquqiy tahlil o'tkazilmoqda...",
         parse_mode="HTML",
     )
+    _ingest_legal_document(message.chat.id, wait_m.message_id, user_id, doc.file_id, fname)
 
+
+@bot.callback_query_handler(func=lambda call: call.data in ("kbdoc_yes", "kbdoc_no"))
+def handle_kb_document_confirmation(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "Ruxsat yo'q!", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+
+    pending = admin_state.get(user_id, {}).pop("pending_kb_doc", None)
+    if call.data == "kbdoc_no" or not pending:
+        text = "❌ Ҳужжат базага қўшилмади." if call.data == "kbdoc_no" else "⚠️ Сўров эскирган. Ҳужжатни қайта юборинг."
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
+        return
+
+    bot.edit_message_text(
+        f"⏳ <b>«{esc(pending['file_name'])}»</b> qabul qilinmoqda va chuqur huquqiy tahlil o'tkazilmoqda...",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+    )
+    _ingest_legal_document(call.message.chat.id, call.message.message_id, user_id, pending["file_id"], pending["file_name"])
+
+
+def _ingest_legal_document(chat_id, wait_message_id, user_id, file_id, fname):
+    """Hujjatni yuklab oladi, huquqiy bilimlar bazasiga qo'shadi va qayta indekslaydi."""
     try:
-        file_info = bot.get_file(doc.file_id)
+        file_info = bot.get_file(file_id)
         downloaded = bot.download_file(file_info.file_path)
         # Fayl nomi foydalanuvchidan keladi: papkadan tashqariga yozilmasligi uchun faqat oxirgi qismi olinadi
         fname = os.path.basename(fname.replace("\\", "/")) or "hujjat.pdf"
@@ -1790,7 +1836,7 @@ def handle_admin_document_upload(message):
             f"📚 <b>Jami bazadagi hujjatlar:</b> {idx['total_documents']} ta\n\n"
             f"<i>Endi fuqarolar murojaat qilganda bot bevosita mana shu qaror/buyruqdan moddani havola qilib, aniq va yolg'onsiz javob beradi.</i>"
         )
-        bot.edit_message_text(success_msg, message.chat.id, wait_m.message_id, parse_mode="HTML")
+        bot.edit_message_text(success_msg, chat_id, wait_message_id, parse_mode="HTML")
 
         if user_id in admin_state and admin_state[user_id].get("waiting_for") == "legal_document":
             admin_state[user_id].pop("waiting_for", None)
@@ -1799,8 +1845,8 @@ def handle_admin_document_upload(message):
         print("Hujjat yuklashda xatolik:", e)
         bot.edit_message_text(
             f"⚠️ Hujjatni tahlil qilishda xatolik yuz berdi: {e}",
-            message.chat.id,
-            wait_m.message_id,
+            chat_id,
+            wait_message_id,
         )
 
 
@@ -3112,7 +3158,10 @@ def process_admin_direct_reply(message):
         return
 
     javob_matni = message.text.strip()
-    updated_row = update_murojaat_status(murojaat_id, "Arizangiz qanoatlantirilgan", admin_izohi=javob_matni)
+    # Javob murojaatni yopmaydi (xodim hujjat so'rashi mumkin): yakuniy qarorni tugma bilan belgilaydi
+    current = get_murojaat_by_id(murojaat_id) or {}
+    new_status = current.get("Status") if current.get("Status") in ["Hal etildi", "Rad etildi", "Yopildi"] else "O'rganilmoqda"
+    updated_row = update_murojaat_status(murojaat_id, new_status, admin_izohi=javob_matni)
     if updated_row:
         try:
             target_uid = int(updated_row["Telegram_ID"])
@@ -3127,7 +3176,13 @@ def process_admin_direct_reply(message):
                 text=reply_text,
                 parse_mode="HTML",
             )
-            bot.send_message(message.chat.id, f"✅ Жавобингиз фуқарога ({cit_fio}) муваффақиятли юборилди ва базага сақланди (ID: #{esc(murojaat_id)})!")
+            bot.send_message(
+                message.chat.id,
+                f"✅ Жавобингиз фуқарога ({esc(cit_fio)}) юборилди ва базага сақланди (ID: #{esc(murojaat_id)}).\n"
+                f"📌 Ҳолати: <b>{esc(new_status)}</b>. Якуний қарор бўлса, қуйидаги тугмани босинг:",
+                reply_markup=get_murojaat_admin_buttons(murojaat_id),
+                parse_mode="HTML",
+            )
         except Exception as e:
             bot.send_message(message.chat.id, f"⚠️ Фуқарога юборишда хатолик: {e}")
         admin_state.pop(message.from_user.id, None)
