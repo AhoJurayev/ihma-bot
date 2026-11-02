@@ -8,8 +8,10 @@ Rasmiy O'zbek tili va qonunchilik me'yorlari asosida to'liq lokalizatsiya qiling
 import os
 import re
 import io
+import html
 import json
 import time
+import uuid
 import sqlite3
 import threading
 import urllib.request
@@ -27,10 +29,11 @@ from utils.audio_transcriber import transcribe_audio_bytes
 
 # --- 1. KONFIGURATSIYA VA YO'LLAR ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ADMIN_KB_DIR = os.path.join(BASE_DIR, "admin_social_kb")
+DATA_DIR = os.getenv("IHMA_DATA_DIR", "").strip() or BASE_DIR
+ADMIN_KB_DIR = os.path.join(DATA_DIR, "admin_social_kb")
 ADMIN_KB_INDEX_JSON = os.path.join(ADMIN_KB_DIR, "kb_index.json")
 TELEGRAPH_TOKEN_FILE = os.path.join(ADMIN_KB_DIR, "telegraph_token.json")
-DB_FILE = os.path.join(BASE_DIR, "ihma_database.db")
+DB_FILE = os.path.join(DATA_DIR, "ihma_database.db")
 os.makedirs(ADMIN_KB_DIR, exist_ok=True)
 
 _kb_lock = threading.Lock()
@@ -504,7 +507,8 @@ def add_document_to_admin_kb(file_bytes: bytes, filename: str, title: str = None
     if len(file_bytes) > 20 * 1024 * 1024:
         raise ValueError("Fayl hajmi ruxsat etilgan 20MB limitidan oshib ketdi!")
 
-    ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".txt"}
+    # Eski .doc va .xls formatlarini python-docx va openpyxl o'qiy olmaydi
+    ALLOWED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".txt"}
     clean_base = os.path.basename(filename)
     ext = os.path.splitext(clean_base)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -532,7 +536,7 @@ def add_document_to_admin_kb(file_bytes: bytes, filename: str, title: str = None
     if not chunks:
         raise ValueError("Hujjat matnini bo'laklashda xatolik yuz berdi!")
 
-    doc_id = f"SKB-{int(time.time())}"
+    doc_id = f"SKB-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     doc_title = title or clean_base
     safe_name = f"{doc_id}_{re.sub(r'[^a-zA-Z0-9_.-]', '_', clean_base)}"
     disk_path = os.path.join(ADMIN_KB_DIR, safe_name)
@@ -575,11 +579,11 @@ def add_document_to_admin_kb(file_bytes: bytes, filename: str, title: str = None
 
 def add_text_to_admin_kb(text: str, title: str = None) -> dict:
     """Admin tomonidan yuborilgan to'g'ridan-to'g'ri matnni bazaga qo'shadi."""
-    clean_content = clean_text_for_tokens(text)
+    clean_content = clean_text_for_tokens(mask_pii(text))
     if not clean_content or len(clean_content) < 10:
         raise ValueError("Kiritilgan matn juda qisqa!")
 
-    doc_id = f"SKB-{int(time.time())}"
+    doc_id = f"SKB-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     doc_title = title or (clean_content[:40].replace("\n", " ") + "...")
     chunks = chunk_text(clean_content)
 
@@ -754,14 +758,13 @@ def ask_ai_consultant(case_text: str, image_bytes: bytes = None) -> str:
     server_kw = ["server", "сервер", "ram", "cpu", "диск", "uptime", "процессор", "хотира", "лог", "log", "бошқарув", "status", "статус", "тизим"]
     if any(k in lower_case for k in server_kw):
         try:
-            from utils.server_monitor import get_system_metrics, get_recent_logs
+            from utils.server_monitor import get_system_metrics
             m = get_system_metrics()
-            log_tail = get_recent_logs(os.path.join(BASE_DIR, "bot.log"), lines_count=8)
+            # Loglar tashqi AI ga yuborilmaydi: ularda fuqaro ma'lumoti bo'lishi mumkin
             server_info = (
                 "\n\n🖥️ [ЖОРИЙ СЕРВЕР ВА БОТ ҲОЛАТИ (LIVE METRICS)]:\n"
                 f"- CPU: {m['cpu_percent']}%, RAM: {m['ram_percent']}%, Диск: {m['disk_percent']}%\n"
                 f"- Сервер иш вақти: {m['server_uptime']}, Бот Uptime: {m['bot_uptime']}\n"
-                f"- Охирги логлар:\n{log_tail}\n"
             )
             rag_context += server_info
         except Exception:
@@ -1110,7 +1113,7 @@ def handle_admin_ai_message(bot: telebot.TeleBot, message, admin_state_dict: dic
     text = (getattr(message, "text", "") or getattr(message, "caption", "") or "").strip()
 
     # Bekor qilish tekshiruvi
-    if text in ["🔙 бекор қилиш", "бекор қилиш", "🔙 bekor qiliş", "🔙 bekor qilish", "bekor qiliş", "bekor qilish", "/cancel"]:
+    if text.lower() in ["🔙 бекор қилиш", "бекор қилиш", "🔙 bekor qiliş", "🔙 bekor qilish", "bekor qiliş", "bekor qilish", "/cancel"]:
         if user_id in admin_state_dict and admin_state_dict[user_id].get("action") in ["waiting_for_admin_kb_upload", "waiting_for_ai_case"]:
             admin_state_dict.pop(user_id, None)
             bot.send_message(
@@ -1236,12 +1239,14 @@ def handle_admin_ai_message(bot: telebot.TeleBot, message, admin_state_dict: dic
 
             solution_text = ask_ai_consultant(masked_case, image_bytes=img_bytes)
 
-            # 1. Telegraph maqolasi yaratish (Instant View)
+            # 1. Telegraph maqolasi (Instant View): sahifa HAMMAGA ochiq, regex esa ism va manzilni yashirmaydi.
+            # Shu sababli faqat ADMIN_TELEGRAPH_PUBLISH=1 bo'lganda va niqoblangan matn bilan nashr qilinadi.
             clean_case_title = "Shayx-Ali MFY | Keys Tahlili va Xulosa"
-            telegraph_url = publish_case_to_telegraph(clean_case_title, case_description, solution_text)
+            telegraph_url = ""
+            if os.getenv("ADMIN_TELEGRAPH_PUBLISH", "0").strip() == "1":
+                telegraph_url = publish_case_to_telegraph(clean_case_title, masked_case, mask_pii(solution_text))
 
             # 2. Xotiraga keshlash (Admin Telegramda to'liq o'qishni xohlasa yoki Word yuklasa)
-            import uuid
             cache_id = str(uuid.uuid4())[:8]
             _ai_solutions_cache[cache_id] = {
                 "title": clean_case_title,
@@ -1259,7 +1264,7 @@ def handle_admin_ai_message(bot: telebot.TeleBot, message, admin_state_dict: dic
             summary_card = (
                 "🏛 <b>ҚАРШИ ШАҲАР «ШАЙХ-АЛИ» МФЙ ИЖТИМОИЙ ХОДИМИ AI-КОНСУЛЬТАНТИ</b>\n\n"
                 f"📋 <b>Таҳлил қилинган кейс / мурожаат:</b>\n"
-                f"<i>{case_preview}</i>\n\n"
+                f"<i>{html.escape(case_preview)}</i>\n\n"
                 "⚖️ <b>ҲУҚУҚИЙ ВА МЕТОДИК ТАҲЛИЛ ХУЛОСАСИ:</b>\n"
                 "1️⃣ <b>Ҳуқуқий баҳо:</b> ИҲМА низомлари, ВМ-654 ва ВМ-62 мезонлари бўйича тўлиқ асосланди;\n"
                 "2️⃣ <b>Амалий алгоритм:</b> Ижтимоий ходимнинг қадамба-қадам ҳаракатлар режаси ишлаб чиқилди;\n"

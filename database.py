@@ -21,7 +21,8 @@ import sqlite3
 import secrets
 import logging
 import threading
-from datetime import datetime, date
+from contextlib import closing
+from datetime import datetime, date, timedelta
 import pandas as pd
 import docx
 from docx.shared import Inches, Pt
@@ -34,14 +35,19 @@ _db_lock = threading.Lock()
 _excel_lock = threading.Lock()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "ihma_database.db")
-BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
-EXCEL_FUQAROLAR = os.path.join(BASE_DIR, "fuqarolar.xlsx")
-EXCEL_MUROJAATLAR = os.path.join(BASE_DIR, "murojaatlar.xlsx")
-EXCEL_NAVBATLAR = os.path.join(BASE_DIR, "navbatlar.xlsx")
-DALOLATNOMA_DIR = os.path.join(BASE_DIR, "dalolatnomalar")
+# Fuqaro ma'lumotlari saqlanadigan papka (testlar va serverda alohida joyga ko'chirish mumkin)
+DATA_DIR = os.getenv("IHMA_DATA_DIR", "").strip() or BASE_DIR
+DB_FILE = os.path.join(DATA_DIR, "ihma_database.db")
+BACKUPS_DIR = os.path.join(DATA_DIR, "backups")
+EXPORTS_DIR = os.path.join(DATA_DIR, "exports")
+EXCEL_FUQAROLAR = os.path.join(DATA_DIR, "fuqarolar.xlsx")
+EXCEL_MUROJAATLAR = os.path.join(DATA_DIR, "murojaatlar.xlsx")
+EXCEL_NAVBATLAR = os.path.join(DATA_DIR, "navbatlar.xlsx")
+DALOLATNOMA_DIR = os.path.join(DATA_DIR, "dalolatnomalar")
+BACKUPS_TO_KEEP = 30
 
 os.makedirs(BACKUPS_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 os.makedirs(DALOLATNOMA_DIR, exist_ok=True)
 
 # 8 ta standartlashtirilgan rasmiy murojaat maqomi
@@ -56,7 +62,18 @@ APPLICATION_STATUSES = [
     "Yopildi"                       # 8. Yopildi
 ]
 
+# Ijtimoiy xodim ishtirokisiz yopiladigan savollar: ko'rib chiqish navbatiga tushmaydi
+AUTO_ANSWER_STATUSES = [
+    "AI orqali javob berildi",
+    "Mahalliy baza orqali javob berildi",
+]
+
+# Ijtimoiy xodim hali ko'rib chiqishi kerak bo'lgan maqomlar
+OPEN_APPEAL_STATUSES = ["Yangi", "Qabul qilindi", "O'rganilmoqda", "Hujjat kutilmoqda", "Boshqa tashkilotga yuborildi", "Kutmoqda"]
+
 STATUS_NORMALIZATION_MAP = {
+    "ai orqali javob berildi": "AI orqali javob berildi",
+    "mahalliy baza orqali javob berildi": "Mahalliy baza orqali javob berildi",
     "yangi": "Yangi",
     "qabul qilindi": "Qabul qilindi",
     "o'rganilmoqda": "O'rganilmoqda",
@@ -314,25 +331,91 @@ def init_database(db_path=None):
             except Exception as e:
                 logger.error(f"Murojaatlarni import qilishda xatolik: {e}")
 
-        cur.execute("SELECT COUNT(*) FROM navbatlar")
-        if cur.fetchone()[0] == 0 and os.path.exists(EXCEL_NAVBATLAR):
-            try:
-                df_n = pd.read_excel(EXCEL_NAVBATLAR, dtype=str).fillna("")
-                for _, r in df_n.iterrows():
-                    cur.execute("""
-                    INSERT OR REPLACE INTO navbatlar (Navbat_ID, Yaratilgan_Vaqt, Telegram_ID, FIO, Telefon, Kocha_Manzil, Qabul_Kuni, Qabul_Soati, Status, token)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        str(r.get("Navbat_ID", "")), r.get("Yaratilgan_Vaqt", ""), str(r.get("Telegram_ID", "")),
-                        r.get("FIO", ""), r.get("Telefon", ""), r.get("Kocha_Manzil", ""),
-                        r.get("Qabul_Kuni", ""), r.get("Qabul_Soati", ""), r.get("Status", "Band qilingan"),
-                        secrets.token_urlsafe(16)
-                    ))
-                conn.commit()
-            except Exception as e:
-                logger.error(f"Navbatlarni import qilishda xatolik: {e}")
+        # Eski bot oqimi navbatlarni faqat navbatlar.xlsx ga yozgan: ularni bir marta bazaga qo'shamiz
+        cur.execute("SELECT 1 FROM system_settings WHERE key = 'excel_navbat_merged'")
+        if not cur.fetchone():
+            if os.path.exists(EXCEL_NAVBATLAR):
+                try:
+                    df_n = pd.read_excel(EXCEL_NAVBATLAR, dtype=str).fillna("")
+                    for _, r in df_n.iterrows():
+                        navbat_id = str(r.get("Navbat_ID", ""))
+                        cur.execute("SELECT Telegram_ID, Qabul_Kuni FROM navbatlar WHERE Navbat_ID = ?", (navbat_id,))
+                        existing = cur.fetchone()
+                        if existing:
+                            if existing[0] == str(r.get("Telegram_ID", "")) and existing[1] == r.get("Qabul_Kuni", ""):
+                                continue
+                            # Excel va bazada bir xil raqam boshqa navbatga tegishli: yozuv yo'qolmasin
+                            navbat_id = f"{navbat_id}-X"
+                        cur.execute("""
+                        INSERT OR IGNORE INTO navbatlar (Navbat_ID, Yaratilgan_Vaqt, Telegram_ID, FIO, Telefon, Kocha_Manzil, Qabul_Kuni, Qabul_Soati, Status, token)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            navbat_id, r.get("Yaratilgan_Vaqt", ""), str(r.get("Telegram_ID", "")),
+                            r.get("FIO", ""), r.get("Telefon", ""), r.get("Kocha_Manzil", ""),
+                            r.get("Qabul_Kuni", ""), r.get("Qabul_Soati", ""), r.get("Status", "Band qilingan"),
+                            secrets.token_urlsafe(16)
+                        ))
+                        if cur.rowcount == 0:
+                            logger.warning(f"Excel navbati {navbat_id} faol navbat bilan to'qnashgani uchun qo'shilmadi")
+                except Exception as e:
+                    logger.error(f"Navbatlarni import qilishda xatolik: {e}")
+            cur.execute("""
+            INSERT OR IGNORE INTO system_settings (key, value, description, updated_at)
+            VALUES ('excel_navbat_merged', '1', 'Eski navbatlar.xlsx bazaga ko''chirilgan', ?)
+            """, (init_now,))
+            conn.commit()
 
+        # Faqat bir marta: yangi yozuvlar keyinchalik eski qoida bo'yicha o'zgarib ketmasligi kerak
+        cur.execute("SELECT 1 FROM system_settings WHERE key = 'legacy_rows_migrated'")
+        if not cur.fetchone():
+            _migrate_legacy_rows(cur)
+            cur.execute("""
+            INSERT OR IGNORE INTO system_settings (key, value, description, updated_at)
+            VALUES ('legacy_rows_migrated', '1', 'Eski yozuvlar joriy qoidalarga keltirilgan', ?)
+            """, (init_now,))
+        conn.commit()
         conn.close()
+
+    _restrict_file_permissions(target_db)
+
+
+def _migrate_legacy_rows(cur):
+    """Eski yozuvlarni joriy qoidalarga keltiradi."""
+    # Eski kod avtomatik javob berilgan savollarni ham "Yangi" deb saqlagan.
+    # Faqat javobi bor, oddiy va admin tegmagan yozuvlar yopiladi: shubhali holat navbatda qoladi.
+    cur.execute("""
+    UPDATE murojaatlar SET Status = ?
+    WHERE Status = 'Yangi' AND Turi = 'QONUNIY_MASLAHAT' AND Muhimlik = 'ODDIY'
+      AND TRIM(COALESCE(AI_Javobi, '')) != '' AND TRIM(COALESCE(Admin_Izohi, '')) = ''
+    """, (AUTO_ANSWER_STATUSES[0],))
+
+    # Bu matn ijtimoiy xodim javobi emas, lekin fuqaroga javob sifatida ko'ringan
+    cur.execute("UPDATE murojaatlar SET Admin_Izohi = '' WHERE Admin_Izohi = 'Mini App orqali yuborildi'")
+
+    # Faol navbatlar yagona sana (YYYY-MM-DD) va vaqt (HH:MM) formatiga o'tadi,
+    # aks holda bir xil vaqtni turli yozuvda ikki kishi band qila oladi
+    cur.execute("SELECT Navbat_ID, Qabul_Kuni, Qabul_Soati FROM navbatlar WHERE Status = 'Band qilingan'")
+    for navbat_id, kun, soat in cur.fetchall():
+        parsed_day = parse_appointment_date(kun)
+        new_day = parsed_day.isoformat() if parsed_day else kun
+        new_slot = normalize_time_slot(soat) or soat
+        if new_day == kun and new_slot == soat:
+            continue
+        try:
+            cur.execute(
+                "UPDATE navbatlar SET Qabul_Kuni = ?, Qabul_Soati = ? WHERE Navbat_ID = ?",
+                (new_day, new_slot, navbat_id),
+            )
+        except sqlite3.IntegrityError:
+            logger.warning(f"Navbat {navbat_id} boshqa navbat bilan to'qnashgani uchun o'zgartirilmadi")
+
+
+def _restrict_file_permissions(path):
+    """Fuqaro ma'lumotlari bor fayllarni faqat egasi o'qiy oladigan qiladi."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError as e:
+        logger.warning(f"Fayl huquqini o'rnatib bo'lmadi: {e}")
 
 
 # ==============================================================================
@@ -355,8 +438,41 @@ def backup_database(destination_dir=None, source_db=None) -> str:
         dst_conn.close()
         src_conn.close()
 
-    log_audit_event("SYSTEM", "DB_BACKUP", backup_file, "Muvaffaqiyatli zaxira olindi")
+    _restrict_file_permissions(backup_file)
+    prune_old_backups(dest_dir)
+    log_audit_event("SYSTEM", "DB_BACKUP", backup_file, "Muvaffaqiyatli zaxira olindi", db_path=source_db)
     return backup_file
+
+
+def backup_if_due(max_age_hours: int = 24, db_path=None, backup_dir=None):
+    """Eng so'nggi zaxira `max_age_hours` soatdan eski bo'lsa yangisini oladi; olinmasa None qaytaradi."""
+    target_dir = backup_dir or BACKUPS_DIR
+    os.makedirs(target_dir, exist_ok=True)
+    mtimes = [
+        os.path.getmtime(os.path.join(target_dir, n))
+        for n in os.listdir(target_dir)
+        if n.startswith("ihma_database_backup_") and n.endswith(".db")
+    ]
+    if mtimes and (datetime.now().timestamp() - max(mtimes)) < max_age_hours * 3600:
+        return None
+    return backup_database(db_path, backup_dir)
+
+
+def prune_old_backups(backup_dir=None, keep: int = BACKUPS_TO_KEEP) -> int:
+    """Eng yangi `keep` ta zaxiradan eskilarini o'chiradi, o'chirilganlar sonini qaytaradi."""
+    target_dir = backup_dir or BACKUPS_DIR
+    names = sorted(
+        n for n in os.listdir(target_dir)
+        if n.startswith("ihma_database_backup_") and n.endswith(".db")
+    )
+    removed = 0
+    for name in names[:-keep] if keep > 0 else names:
+        try:
+            os.remove(os.path.join(target_dir, name))
+            removed += 1
+        except OSError as e:
+            logger.warning(f"Eski zaxirani o'chirib bo'lmadi ({name}): {e}")
+    return removed
 
 
 def restore_database(backup_file: str, target_db: str) -> bool:
@@ -423,8 +539,92 @@ def save_or_update_citizen(user_id, fio, telefon, pasport_seriya="", jshshir="",
             """, (uid_str, fio, telefon, pasport_seriya, jshshir, combined_doc, kocha_manzil, geolokatsiya, combined_address, status, til, now_str))
         conn.close()
 
-    log_audit_event(uid_str, "CITIZEN_PROFILE_UPDATE", uid_str, f"FIO: {fio}, Status: {status}")
+    log_audit_event(uid_str, "CITIZEN_PROFILE_UPDATE", uid_str, f"Status: {status}", db_path=db_path)
     return True
+
+
+def find_duplicate_citizen(user_id, telefon=None, pasport=None, jshshir=None, db_path=None):
+    """
+    Telefon, pasport yoki JSHSHIR boshqa fuqaroda bor-yo'qligini tekshiradi.
+    Qaytadi: (dublikat_bormi, mavjud_yozuv)
+    """
+    def _digits(value):
+        d = re.sub(r"\D", "", str(value or ""))
+        return d[-9:] if len(d) >= 9 else d
+
+    def _doc(value):
+        return re.sub(r"[\s\-_,.;:]", "", str(value or "")).upper()
+
+    norm_tel = _digits(telefon)
+    norm_pasp = _doc(pasport)
+    norm_jsh = _doc(jshshir)
+
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM fuqarolar WHERE Telegram_ID != ?", (str(user_id),)
+            ).fetchall()]
+
+    for r in rows:
+        combined = _doc(r.get("Pasport_JSHSHIR"))
+        if norm_tel and norm_tel == _digits(r.get("Telefon")):
+            return True, r
+        if norm_pasp and (norm_pasp == _doc(r.get("Pasport_Seriya")) or norm_pasp in combined):
+            return True, r
+        if norm_jsh and (norm_jsh == _doc(r.get("JSHSHIR")) or norm_jsh in combined):
+            return True, r
+    return False, None
+
+
+def get_verified_citizens(area_filter: str = None, db_path=None) -> list:
+    """Tasdiqlangan fuqarolar (ko'cha/hudud bo'yicha filtrlash Kirill va Lotinda ishlaydi)."""
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM fuqarolar WHERE Status = 'Tasdiqlangan'"
+            ).fetchall()]
+    if not area_filter:
+        return rows
+    needle = normalize_for_search(area_filter)
+    return [
+        r for r in rows
+        if needle in normalize_for_search(f"{r.get('Kocha_Manzil') or ''} {r.get('Manzil_Geolokatsiya') or ''}")
+    ]
+
+
+def get_known_addresses(limit: int = 8, db_path=None) -> list:
+    """Bazadagi manzillardan namuna (rassilka hududini tanlash uchun)."""
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = conn.execute("""
+            SELECT DISTINCT Kocha_Manzil FROM fuqarolar
+            WHERE Kocha_Manzil IS NOT NULL AND TRIM(Kocha_Manzil) != '' LIMIT ?
+            """, (limit,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_system_stats(db_path=None) -> dict:
+    """Admin paneli uchun umumiy statistika (faqat SQLite dan)."""
+    placeholders = ",".join("?" for _ in OPEN_APPEAL_STATUSES)
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            def count(sql, params=()):
+                return conn.execute(sql, params).fetchone()[0]
+            return {
+                "fuqarolar_jami": count("SELECT COUNT(*) FROM fuqarolar"),
+                "tasdiqlangan": count("SELECT COUNT(*) FROM fuqarolar WHERE Status = 'Tasdiqlangan'"),
+                "tasdiq_kutayotgan": count("SELECT COUNT(*) FROM fuqarolar WHERE Status = 'Kutmoqda'"),
+                "murojaatlar_jami": count("SELECT COUNT(*) FROM murojaatlar"),
+                "shoshilinch": count(
+                    f"SELECT COUNT(*) FROM murojaatlar WHERE Muhimlik = 'SHOSHILINCH' AND Status IN ({placeholders})",
+                    OPEN_APPEAL_STATUSES,
+                ),
+                "ochiq_murojaatlar": count(
+                    f"SELECT COUNT(*) FROM murojaatlar WHERE Status IN ({placeholders})",
+                    OPEN_APPEAL_STATUSES,
+                ),
+                "faol_navbatlar": count("SELECT COUNT(*) FROM navbatlar WHERE Status = 'Band qilingan'"),
+            }
 
 
 def update_citizen_status(user_id, status, admin_actor="ADMIN", db_path=None):
@@ -486,36 +686,38 @@ def save_murojaat(user_id, savol, ai_javobi, turi, muhimlik, status="Yangi", adm
     norm_status = normalize_application_status(status)
 
     with _db_lock:
-        conn = get_db_connection(db_path)
-        with conn:
+        with closing(get_db_connection(db_path)) as conn, conn:
             cur = conn.cursor()
             # Takroriy yuborilishni tekshirish (oxirgi 60 soniya ichida bir xil savol)
             cur.execute("""
-            SELECT Murojaat_ID FROM murojaatlar 
+            SELECT Murojaat_ID, Sana FROM murojaatlar
             WHERE Telegram_ID = ? AND Savol = ? AND rowid = (SELECT MAX(rowid) FROM murojaatlar WHERE Telegram_ID = ?)
             """, (str(user_id), savol, str(user_id)))
             recent = cur.fetchone()
             if recent:
-                conn.close()
-                return recent[0]
+                try:
+                    is_fresh = (now - datetime.strptime(recent[1], "%Y-%m-%d %H:%M:%S")).total_seconds() < 60
+                except (TypeError, ValueError):
+                    is_fresh = False
+                if is_fresh:
+                    return recent[0]
 
-            cur.execute("SELECT COUNT(*) FROM murojaatlar")
-            count = cur.fetchone()[0]
-            murojaat_id = f"M-{1001 + count}"
+            cur.execute("SELECT MAX(CAST(SUBSTR(Murojaat_ID, 3) AS INTEGER)) FROM murojaatlar WHERE Murojaat_ID LIKE 'M-%'")
+            max_num = cur.fetchone()[0]
+            murojaat_id = f"M-{(max_num or 1000) + 1}"
 
-            kocha = citizen.get("Kocha_Manzil") or citizen.get("Manzil_Geolokatsiya", "Noma'lum")
+            kocha = citizen.get("Kocha_Manzil") or citizen.get("Manzil_Geolokatsiya") or "Noma'lum"
             cur.execute("""
             INSERT INTO murojaatlar (Murojaat_ID, Sana, Oy_Yil, Telegram_ID, FIO, Telefon, Pasport_JSHSHIR, Kocha_Manzil, Savol, AI_Javobi, Turi, Muhimlik, Status, Admin_Izohi, Eslatma_Yuborildi)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 murojaat_id, sana_str, oy_yil_str, str(user_id),
-                citizen.get("FIO", "Noma'lum"), citizen.get("Telefon", "Noma'lum"),
-                citizen.get("Pasport_JSHSHIR", "Noma'lum"), kocha,
+                citizen.get("FIO") or "Noma'lum", citizen.get("Telefon") or "Noma'lum",
+                citizen.get("Pasport_JSHSHIR") or "Noma'lum", kocha,
                 savol, ai_javobi, turi, muhimlik, norm_status, admin_izohi, "Yo'q"
             ))
-        conn.close()
 
-    log_audit_event(str(user_id), "APPEAL_CREATE", murojaat_id, f"Turi: {turi}, Muhimlik: {muhimlik}")
+    log_audit_event(str(user_id), "APPEAL_CREATE", murojaat_id, f"Turi: {turi}, Muhimlik: {muhimlik}", db_path=db_path)
     return murojaat_id
 
 
@@ -589,17 +791,47 @@ def get_citizen_appeals(user_id, limit=20, db_path=None):
 
 def get_pending_appeals(limit=15, db_path=None):
     """Ko'rib chiqilishi kerak bo'lgan ochiq murojaatlar."""
+    placeholders = ",".join("?" for _ in OPEN_APPEAL_STATUSES)
     with _db_lock:
         conn = get_db_connection(db_path)
         cur = conn.cursor()
-        cur.execute("""
-        SELECT * FROM murojaatlar 
-        WHERE Status IN ('Yangi', 'Qabul qilindi', 'O''rganilmoqda', 'Hujjat kutilmoqda', 'Boshqa tashkilotga yuborildi', 'Kutmoqda')
+        cur.execute(f"""
+        SELECT * FROM murojaatlar
+        WHERE Status IN ({placeholders})
         ORDER BY CASE WHEN Muhimlik = 'SHOSHILINCH' THEN 0 ELSE 1 END, rowid DESC LIMIT ?
-        """, (limit,))
+        """, (*OPEN_APPEAL_STATUSES, limit))
         rows = cur.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+
+def get_overdue_appeals(hours: int = 24, db_path=None) -> list:
+    """`hours` soatdan beri ochiq turgan murojaatlar (eng eskisi birinchi)."""
+    deadline = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    placeholders = ",".join("?" for _ in OPEN_APPEAL_STATUSES)
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = conn.execute(f"""
+            SELECT * FROM murojaatlar
+            WHERE Status IN ({placeholders}) AND Sana <= ?
+            ORDER BY Sana ASC
+            """, (*OPEN_APPEAL_STATUSES, deadline)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_appeal_reminder_sent(murojaat_id, db_path=None):
+    """SLA eslatmasi yuborilganini belgilaydi (qayta yuborilmasligi uchun)."""
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn, conn:
+            conn.execute("UPDATE murojaatlar SET Eslatma_Yuborildi = 'Ha' WHERE Murojaat_ID = ?", (str(murojaat_id),))
+
+
+def get_month_appeals(oy_yil, db_path=None) -> list:
+    """Berilgan oyning (MM-YYYY) barcha murojaatlari."""
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = conn.execute("SELECT * FROM murojaatlar WHERE Oy_Yil = ? ORDER BY rowid", (str(oy_yil),)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_monthly_appeal_stats(oy_yil, db_path=None):
@@ -665,6 +897,41 @@ def search_citizens(query: str, limit: int = 10, db_path=None):
 # ==============================================================================
 # 3. ELEKTRON NAVBATLAR (POYGA HOLATI VA KONFLIKTSIZ TRANZAKSIYALAR)
 # ==============================================================================
+QUEUE_SLOTS = ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"]
+QUEUE_MAX_DAYS_AHEAD = 30
+
+
+def parse_appointment_date(value):
+    """Qabul sanasini date ga o'giradi; format noto'g'ri bo'lsa None qaytaradi."""
+    clean = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y.%m.%d"):
+        try:
+            return datetime.strptime(clean, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def normalize_time_slot(value):
+    """'09:00' va '09:00 - 10:00' bitta vaqt: boshlanish vaqtini (HH:MM) qaytaradi, aks holda None."""
+    match = re.match(r"^(\d{2}:\d{2})(\s*-\s*\d{2}:\d{2})?$", str(value or "").strip())
+    return match.group(1) if match else None
+
+
+def get_booked_slots(qabul_kuni, db_path=None) -> list:
+    """Berilgan sanadagi band vaqtlar ro'yxati (HH:MM). Shaxsiy ma'lumot qaytarmaydi."""
+    day = parse_appointment_date(qabul_kuni)
+    if not day:
+        return []
+    with _db_lock:
+        with closing(get_db_connection(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT Qabul_Soati FROM navbatlar WHERE Qabul_Kuni = ? AND Status = 'Band qilingan'",
+                (day.isoformat(),),
+            ).fetchall()
+    return [normalize_time_slot(r[0]) or r[0] for r in rows]
+
+
 def save_navbat(telegram_id, fio, telefon, kocha, qabul_kuni, qabul_soati, db_path=None) -> str:
     """
     Elektron navbat yozish (Atomic Transaction & Concurrency Safe):
@@ -676,36 +943,34 @@ def save_navbat(telegram_id, fio, telefon, kocha, qabul_kuni, qabul_soati, db_pa
     - Xavfsiz unikal token (QR kod uchun) shakllantiradi.
     """
     # 1. Sanani tekshirish (o'tgan sanani va dam olish kunlarini taqiqlash)
-    app_date = None
-    clean_kuni = str(qabul_kuni).strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y.%m.%d"):
-        try:
-            app_date = datetime.strptime(clean_kuni, fmt).date()
-            break
-        except ValueError:
-            pass
-
-    if app_date is not None:
-        today = date.today()
-        if app_date < today:
-            raise ValueError(f"O'tgan sana uchun navbat olish mumkin emas ({qabul_kuni})")
-    else:
-        # Agar sana formati mutlaqo noaniq bo'lsa
+    app_date = parse_appointment_date(qabul_kuni)
+    if app_date is None:
         raise ValueError(f"Noto'g'ri sana formati kiritildi: {qabul_kuni}")
 
+    today = date.today()
+    if app_date < today:
+        raise ValueError(f"O'tgan sana uchun navbat olish mumkin emas ({qabul_kuni})")
+    if app_date.weekday() >= 5:
+        raise ValueError("Shanba va yakshanba kunlari qabul o'tkazilmaydi. Iltimos, ish kunini tanlang.")
+    if app_date > today + timedelta(days=QUEUE_MAX_DAYS_AHEAD):
+        raise ValueError(f"Navbatni ko'pi bilan {QUEUE_MAX_DAYS_AHEAD} kun oldindan olish mumkin.")
+
+    # Barcha yozuvlar yagona formatda saqlanadi: bir vaqtni turli yozuvda ikki marta band qilib bo'lmaydi
+    clean_kuni = app_date.isoformat()
+
     # 1-B. Qabul vaqti slotini tekshirish
-    clean_soati = str(qabul_soati).strip()
-    allowed_slots = {"09:00", "10:00", "11:00", "14:00", "15:00", "16:00", "17:00", "09:00 - 10:00", "10:00 - 11:00", "11:00 - 12:00", "14:00 - 15:00", "15:00 - 16:00", "16:00 - 17:00"}
-    if clean_soati not in allowed_slots and not re.match(r"^\d{2}:\d{2}(\s*-\s*\d{2}:\d{2})?$", clean_soati):
+    clean_soati = normalize_time_slot(qabul_soati)
+    if clean_soati not in QUEUE_SLOTS:
         raise ValueError(f"Noto'g'ri qabul vaqti tanlandi: {qabul_soati}")
+    if app_date == today and clean_soati <= datetime.now().strftime("%H:%M"):
+        raise ValueError(f"Bugungi {clean_soati} qabul vaqti o'tib ketdi. Iltimos, boshqa vaqtni tanlang.")
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     unique_token = secrets.token_urlsafe(16)
 
     try:
         with _db_lock:
-            conn = get_db_connection(db_path)
-            with conn:
+            with closing(get_db_connection(db_path)) as conn, conn:
                 cur = conn.cursor()
 
                 # 2. Fuqaroning mavjud faol navbatini tekshirish
@@ -742,7 +1007,6 @@ def save_navbat(telegram_id, fio, telefon, kocha, qabul_kuni, qabul_soati, db_pa
                 INSERT INTO navbatlar (Navbat_ID, Yaratilgan_Vaqt, Telegram_ID, FIO, Telefon, Kocha_Manzil, Qabul_Kuni, Qabul_Soati, Status, token)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Band qilingan', ?)
                 """, (navbat_id, now_str, str(telegram_id), fio, telefon, kocha, clean_kuni, clean_soati, unique_token))
-            conn.close()
     except sqlite3.IntegrityError as ie:
         err_s = str(ie).lower()
         if "telegram_id" in err_s:
@@ -750,7 +1014,7 @@ def save_navbat(telegram_id, fio, telefon, kocha, qabul_kuni, qabul_soati, db_pa
         else:
             raise ValueError(f"Kechirasiz, ushbu vaqt ({clean_kuni} {clean_soati}) boshqa fuqaro tomonidan band qilingan.")
 
-    log_audit_event(str(telegram_id), "APPOINTMENT_BOOK", navbat_id, f"{clean_kuni} {clean_soati}")
+    log_audit_event(str(telegram_id), "APPOINTMENT_BOOK", navbat_id, f"{clean_kuni} {clean_soati}", db_path=db_path)
     return navbat_id
 
 
@@ -761,8 +1025,7 @@ def cancel_navbat(navbat_id: str, user_id=None, is_admin: bool = False, reason: 
     """
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _db_lock:
-        conn = get_db_connection(db_path)
-        with conn:
+        with closing(get_db_connection(db_path)) as conn, conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM navbatlar WHERE Navbat_ID = ?", (str(navbat_id),))
             row = cur.fetchone()
@@ -781,41 +1044,50 @@ def cancel_navbat(navbat_id: str, user_id=None, is_admin: bool = False, reason: 
             SET Status = 'Bekor qilingan', Bekor_Qilingan_Vaqt = ?
             WHERE Navbat_ID = ?
             """, (now_str, str(navbat_id)))
-        conn.close()
 
     actor = "ADMIN" if is_admin else str(user_id)
-    log_audit_event(actor, "APPOINTMENT_CANCEL", str(navbat_id), f"Sabab: {reason or 'Fuqaro/Admin tashabbusi'}")
+    log_audit_event(actor, "APPOINTMENT_CANCEL", str(navbat_id), f"Sabab: {reason or 'Fuqaro/Admin tashabbusi'}", db_path=db_path)
     return True
 
 
 def reschedule_navbat(navbat_id: str, new_date: str, new_slot: str, user_id=None, is_admin: bool = False, db_path=None) -> bool:
     """Navbat sanasi yoki vaqtini qayta belgilash (Reschedule)."""
-    with _db_lock:
-        conn = get_db_connection(db_path)
-        with conn:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM navbatlar WHERE Navbat_ID = ?", (str(navbat_id),))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Navbat topilmadi")
+    parsed_date = parse_appointment_date(new_date)
+    clean_slot = normalize_time_slot(new_slot)
+    if parsed_date is None or clean_slot not in QUEUE_SLOTS:
+        raise ValueError("Noto'g'ri sana yoki qabul vaqti tanlandi.")
+    if parsed_date < date.today() or parsed_date.weekday() >= 5:
+        raise ValueError("Faqat kelgusi ish kunlariga navbat ko'chirish mumkin.")
+    new_date = parsed_date.isoformat()
+    new_slot = clean_slot
 
-            if not is_admin and str(row["Telegram_ID"]) != str(user_id):
-                raise PermissionError("Ruxsat berilmagan amal")
+    try:
+        with _db_lock:
+            with closing(get_db_connection(db_path)) as conn, conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM navbatlar WHERE Navbat_ID = ?", (str(navbat_id),))
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError("Navbat topilmadi")
 
-            # Yangi slot bo'shligini tekshirish
-            cur.execute("""
-            SELECT Navbat_ID FROM navbatlar 
-            WHERE Qabul_Kuni = ? AND Qabul_Soati = ? AND Status = 'Band qilingan' AND Navbat_ID != ?
-            """, (new_date, new_slot, str(navbat_id)))
-            if cur.fetchone():
-                raise ValueError("Tanlangan yangi vaqt boshqa fuqaro tomonidan band qilingan.")
+                if not is_admin and str(row["Telegram_ID"]) != str(user_id):
+                    raise PermissionError("Ruxsat berilmagan amal")
 
-            cur.execute("""
-            UPDATE navbatlar 
-            SET Qabul_Kuni = ?, Qabul_Soati = ?, Status = 'Band qilingan'
-            WHERE Navbat_ID = ?
-            """, (new_date, new_slot, str(navbat_id)))
-        conn.close()
+                # Yangi slot bo'shligini tekshirish
+                cur.execute("""
+                SELECT Navbat_ID FROM navbatlar
+                WHERE Qabul_Kuni = ? AND Qabul_Soati = ? AND Status = 'Band qilingan' AND Navbat_ID != ?
+                """, (new_date, new_slot, str(navbat_id)))
+                if cur.fetchone():
+                    raise ValueError("Tanlangan yangi vaqt boshqa fuqaro tomonidan band qilingan.")
+
+                cur.execute("""
+                UPDATE navbatlar
+                SET Qabul_Kuni = ?, Qabul_Soati = ?, Status = 'Band qilingan'
+                WHERE Navbat_ID = ?
+                """, (new_date, new_slot, str(navbat_id)))
+    except sqlite3.IntegrityError:
+        raise ValueError("Tanlangan yangi vaqt band yoki sizda boshqa faol navbat mavjud.")
 
     actor = "ADMIN" if is_admin else str(user_id)
     log_audit_event(actor, "APPOINTMENT_RESCHEDULE", str(navbat_id), f"Yangi vaqt: {new_date} {new_slot}")
@@ -897,13 +1169,20 @@ def sync_table_to_excel_async(table_name, excel_path, db_path=None):
     t.start()
 
 
+def _neutralize_excel_formulas(df):
+    """Fuqaro yozgan '=...' matni Excel da formula bo'lib ishlab ketmasligi uchun."""
+    def _safe(value):
+        return f"'{value}" if isinstance(value, str) and value.startswith("=") else value
+    return df.apply(lambda col: col.map(_safe))
+
+
 def export_all_to_excel(actor="ADMIN", db_path=None) -> str:
     """
     Admin uchun barcha jadvallarni bitta yangi to'liq Excel faylga atomik eksport qilish.
-    Audit log qayd etiladi.
+    Audit log qayd etiladi. Fayl fuqaro ma'lumotlarini saqlaydi: yuborilgach o'chirilishi kerak.
     """
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    export_path = os.path.join(BASE_DIR, f"Shayxali_MFY_Tizim_Hisoboti_{ts}.xlsx")
+    export_path = os.path.join(EXPORTS_DIR, f"Shayxali_MFY_Tizim_Hisoboti_{ts}.xlsx")
     tmp_path = export_path.replace(".xlsx", "_tmp.xlsx")
 
     try:
@@ -915,12 +1194,13 @@ def export_all_to_excel(actor="ADMIN", db_path=None) -> str:
             conn.close()
 
         with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-            df_fuqaro.to_excel(writer, sheet_name="Fuqarolar", index=False)
-            df_murojaat.to_excel(writer, sheet_name="Murojaatlar", index=False)
-            df_navbat.to_excel(writer, sheet_name="Navbatlar", index=False)
+            _neutralize_excel_formulas(df_fuqaro).to_excel(writer, sheet_name="Fuqarolar", index=False)
+            _neutralize_excel_formulas(df_murojaat).to_excel(writer, sheet_name="Murojaatlar", index=False)
+            _neutralize_excel_formulas(df_navbat).to_excel(writer, sheet_name="Navbatlar", index=False)
 
         os.replace(tmp_path, export_path)
-        log_audit_event(actor, "EXCEL_FULL_EXPORT", export_path, "Barcha jadvallar eksport qilindi")
+        _restrict_file_permissions(export_path)
+        log_audit_event(actor, "EXCEL_FULL_EXPORT", os.path.basename(export_path), "Barcha jadvallar eksport qilindi", db_path=db_path)
         return export_path
     except Exception as e:
         logger.error(f"Excel eksportida xatolik: {e}")
@@ -987,12 +1267,12 @@ def generate_dalolatnoma_docx(murojaat_id, db_path=None):
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
     fields = [
-        ("Мурожаатчи фуқаронинг Ф.И.Ш.:", ensure_cyrillic(m.get("FIO", "Номаълум"))),
-        ("Паспорт маълумоти / ЖШШИР:", m.get("Pasport_JSHSHIR", "Номаълум")),
-        ("Боғланиш телефон рақами:", m.get("Telefon", "Номаълум")),
-        ("Доимий / Вақтинчалик яшаш манзили:", ensure_cyrillic(m.get("Kocha_Manzil", "Номаълум"))),
-        ("Мурожаат тоифаси ва муҳимлиги:", f"{ensure_cyrillic(m.get('Turi', 'УМУМИЙ'))} / {ensure_cyrillic(m.get('Muhimlik', 'ОДДИЙ'))}"),
-        ("Ижро ҳолати (Статус):", ensure_cyrillic(m.get("Status", "Янги"))),
+        ("Мурожаатчи фуқаронинг Ф.И.Ш.:", ensure_cyrillic(m.get("FIO") or "Номаълум")),
+        ("Паспорт маълумоти / ЖШШИР:", m.get("Pasport_JSHSHIR") or "Номаълум"),
+        ("Боғланиш телефон рақами:", m.get("Telefon") or "Номаълум"),
+        ("Доимий / Вақтинчалик яшаш манзили:", ensure_cyrillic(m.get("Kocha_Manzil") or "Номаълум")),
+        ("Мурожаат тоифаси ва муҳимлиги:", f"{ensure_cyrillic(m.get('Turi') or 'УМУМИЙ')} / {ensure_cyrillic(m.get('Muhimlik') or 'ОДДИЙ')}"),
+        ("Ижро ҳолати (Статус):", ensure_cyrillic(m.get("Status") or "Янги")),
     ]
 
     for idx, (label, val) in enumerate(fields):
@@ -1022,7 +1302,7 @@ def generate_dalolatnoma_docx(murojaat_id, db_path=None):
     r_qt.font.name = "Times New Roman"
 
     p_q_body = doc.add_paragraph()
-    r_qb = p_q_body.add_run(to_new_uzbek_latin(m.get("Savol", "Murojaat matni kiritilmagan.")))
+    r_qb = p_q_body.add_run(to_new_uzbek_latin(m.get("Savol") or "Murojaat matni kiritilmagan."))
     r_qb.font.size = Pt(10.5)
     r_qb.font.name = "Times New Roman"
 
@@ -1033,8 +1313,7 @@ def generate_dalolatnoma_docx(murojaat_id, db_path=None):
     r_lt.font.size = Pt(11)
     r_lt.font.name = "Times New Roman"
 
-    import re
-    clean_legal = re.sub(r"<[^>]+>", "", m.get("AI_Javobi", "")).strip()
+    clean_legal = re.sub(r"<[^>]+>", "", m.get("AI_Javobi") or "").strip()
     if len(clean_legal) > 1200:
         clean_legal = clean_legal[:1200] + "..."
 
@@ -1050,7 +1329,7 @@ def generate_dalolatnoma_docx(murojaat_id, db_path=None):
     r_at.font.size = Pt(11)
     r_at.font.name = "Times New Roman"
 
-    admin_note = m.get("Admin_Izohi", "").strip() or "Фуқаронинг хонадонига бориб ўрганиш ишлари олиб борилди ва зарур ижтимоий кўмак чоралари белгиланди."
+    admin_note = (m.get("Admin_Izohi") or "").strip() or "Фуқаронинг хонадонига бориб ўрганиш ишлари олиб борилди ва зарур ижтимоий кўмак чоралари белгиланди."
     p_act_body = doc.add_paragraph()
     r_ab = p_act_body.add_run(ensure_cyrillic(admin_note))
     r_ab.font.size = Pt(10.5)
@@ -1071,7 +1350,7 @@ def generate_dalolatnoma_docx(murojaat_id, db_path=None):
         ("Хотин-қизлар фаоли:", "Н. Авазова"),
         ("Ёшлар етакчиси:", "Ж. Саттаров"),
         ("Ижтимоий ходим:", "А. Жўраев"),
-        ("Мурожаат қилувчи фуқаро:", to_new_uzbek_latin(m.get("FIO", "")))
+        ("Мурожаат қилувчи фуқаро:", to_new_uzbek_latin(m.get("FIO") or ""))
     ]
 
     for role, name in sig_members:
@@ -1158,7 +1437,6 @@ def generate_ai_case_dalolatnoma_docx(case_title: str, case_text: str, md_soluti
     r_st.font.size = Pt(11)
     r_st.font.name = "Times New Roman"
 
-    import re
     clean_sol = re.sub(r"<[^>]+>", "", md_solution)
     clean_sol = re.sub(r"^[ \t]*#{1,6}[ \t]+", "", clean_sol, flags=re.MULTILINE)
     clean_sol = clean_sol.replace("**", "").replace("__", "")

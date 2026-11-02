@@ -86,7 +86,7 @@ def verify_telegram_init_data(
     
     # 1. Signature check
     calculated_hash = compute_init_data_hash(data, bot_token)
-    if not hmac.compare_digest(calculated_hash, received_hash):
+    if not hmac.compare_digest(calculated_hash.encode("utf-8"), received_hash.encode("utf-8")):
         return False, None, "Telegram raqamli imzosi noto'g'ri (soxtalashtirilgan bo'lishi mumkin)"
 
     # 2. auth_date freshness check

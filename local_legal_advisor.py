@@ -216,7 +216,9 @@ def check_direct_legal_rules(norm_q: str, raw_q: str) -> tuple:
         return True, "QONUNIY_MASLAHAT", "ODDIY", ans
 
     # 6. TAZYIQ VA ZO'RAVONLIKDAN HIMOYALASH (O'RQ-1175, VM-493) - [SHOSHILINCH]
-    if any(k in norm_q for k in ["tazyiq", "zoravonlik", "himoya orderi", "kaltak", "urdi", "urish", "doppos", "boshpana", "shelter"]):
+    # "urdi/urish" faqat alohida so'z sifatida: "turdi", "qurish", "ro'yxatda turish" zo'ravonlik emas
+    if any(k in norm_q for k in ["tazyiq", "zoravonlik", "himoya orderi", "kaltak", "doppos", "boshpana", "shelter"]) \
+            or re.search(r"\b(urdi|urish|urishdi|uryapti|uradi)\b", norm_q):
         ans = (
             "🚨 <b>TAZYIQ VA ZO'RAVONLIKDAN JABRLANGAN SHAXSLARNI QONUNIY HIMOYALASH:</b>\n\n"
             "📌 <b>Huquqiy asos:</b> O'zbekiston Respublikasining 2026-yil 11-sentabrdagi <b>O'RQ-1175-son Qonuni</b> hamda Vazirlar Mahkamasining <b>493-son qarori</b>.\n\n"
